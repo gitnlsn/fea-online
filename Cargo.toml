@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/fea-wasm", "crates/nlsn-delaunay"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Keep debug builds of the mesher usable interactively; the refinement loop is
+# far too slow to drive a UI slider at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2

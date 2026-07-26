@@ -1,0 +1,16 @@
+{
+  "name": "fea-online",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser FEA tool: draw geometry, mesh it, and (later) solve on it.",
+  "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "dev": "pnpm build:wasm && pnpm --filter web dev",
+    "build": "pnpm build:wasm && pnpm --filter web build",
+    "start": "pnpm --filter web start",
+    "test:rust": "cargo test --release -- --test-threads=1",
+    "lint": "pnpm --filter web lint",
+    "test:web": "pnpm --filter web test",
+    "test": "pnpm test:rust && pnpm test:web"
+  }
+}

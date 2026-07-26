@@ -1,0 +1,4 @@
+[submodule "crates/nlsn-delaunay"]
+	path = crates/nlsn-delaunay
+	url = git@github.com:gitnlsn/nlsn-delaunay-refine.git
+	branch = harden-mesher
