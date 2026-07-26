@@ -308,6 +308,19 @@ pub fn build_mesh(request: MeshRequest) -> Result<MeshResponse, String> {
         })
         .collect();
 
+    // A mesher that returns nothing for a polygon enclosing real area is
+    // broken, whatever the cause. Reporting success with zero elements is the
+    // worst available failure: the canvas simply renders empty and the user is
+    // told nothing. Clockwise input used to do exactly this, silently, because
+    // the kernel carved the interior away instead of the exterior.
+    if mesh.triangle_count() == 0 {
+        return Err(
+            "meshing produced no elements for a region that encloses area. \
+             This is a bug in the mesher, not in the geometry."
+                .to_string(),
+        );
+    }
+
     Ok(MeshResponse {
         vertex_count: mesh.vertex_count(),
         triangle_count: mesh.triangle_count(),
@@ -751,5 +764,31 @@ mod repro_slider_extremes {
             "only {} elements for a domain needing ~700",
             r.triangle_count
         );
+    }
+}
+
+#[cfg(test)]
+mod convex_regression {
+    use super::*;
+
+    fn count(name: &str, boundary: Vec<[f64; 2]>, min_angle: f64, area_pct: f64) {
+        let max_area = (area_pct / 100.0) * 100.0 * 100.0;
+        match build_mesh(MeshRequest {
+            boundary, holes: vec![], min_angle_deg: min_angle,
+            max_area: Some(max_area), max_steps: Some(60_000), max_triangles: Some(50_000),
+        }) {
+            Ok(r) => println!("{:<12} elements={:<5} nodes={:<5} outcome={}",
+                              name, r.triangle_count, r.vertex_count, r.outcome),
+            Err(e) => println!("{:<12} ERROR: {}", name, e),
+        }
+    }
+
+    #[test]
+    fn convex_shapes_mesh() {
+        // Roughly as drawn in the UI: irregular, non-axis-aligned, CCW.
+        count("triangle", vec![[26.0,18.0],[64.0,14.0],[42.0,72.0]], 18.0, 2.90);
+        count("pentagon", vec![[26.0,44.0],[27.0,15.0],[60.0,16.0],[63.0,44.0],[47.0,72.0]], 18.0, 2.85);
+        count("square", vec![[15.0,15.0],[85.0,15.0],[85.0,70.0],[15.0,70.0]], 18.0, 2.85);
+        count("equilateral", vec![[0.0,0.0],[60.0,0.0],[30.0,51.96]], 18.0, 2.90);
     }
 }
