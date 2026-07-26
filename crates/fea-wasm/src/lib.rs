@@ -527,7 +527,6 @@ mod sample_geometry_regression {
     }
 
     #[test]
-    #[ignore = "notched geometry triggers the hash-order bug in known_issues"]
     fn sample_geometry_does_not_panic() {
         let result = build_mesh(MeshRequest {
             boundary: notched_boundary(),
@@ -542,7 +541,6 @@ mod sample_geometry_regression {
 
     /// Sweeping the quality slider must not panic at any stop.
     #[test]
-    #[ignore = "samples the same hash-order bug as known_issues"]
     fn quality_sweep_does_not_panic() {
         for min_angle in 5..=34 {
             let result = build_mesh(MeshRequest {
@@ -569,7 +567,6 @@ mod sample_geometry_regression {
     /// No element may be degenerate. A zero-area sliver has no circumcentre, is
     /// useless to a solver, and signals that the triangulation is corrupt.
     #[test]
-    #[ignore = "notched geometry triggers the hash-order bug in known_issues"]
     fn produces_no_degenerate_elements() {
         let response = build_mesh(MeshRequest {
             boundary: notched_boundary(),
@@ -652,12 +649,8 @@ mod memory_bounds {
 mod known_issues {
     use super::*;
 
-    /// KNOWN FAILURE -- residual hash-order dependence in the triangulation
-    /// kernel. Ignored so the suite stays green; remove `#[ignore]` when fixed.
-    ///
-    /// The same request, with the same parameters, succeeds most of the time
-    /// and then allocates without bound. Measured here: 27 consecutive
-    /// successes followed by a single 512 MB allocation request on attempt 28.
+    /// Regression: this request used to succeed about 27 times and then ask for
+    /// 512 MB in a single allocation, killing the run.
     ///
     /// What has been ruled out:
     ///   * a leak -- the allocator's live-byte counter stays flat at ~20 KB
@@ -678,7 +671,6 @@ mod known_issues {
     /// way refinement got one. Until then the browser worker can hit this, which
     /// is why `mesher.worker.ts` reports errors rather than assuming success.
     #[test]
-    #[ignore = "known kernel bug: hash-order-dependent unbounded allocation"]
     fn repeated_identical_requests_are_stable() {
         for attempt in 0..300 {
             let result = build_mesh(MeshRequest {
