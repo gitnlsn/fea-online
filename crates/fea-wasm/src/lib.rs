@@ -159,6 +159,13 @@ pub struct MeshResponse {
     /// True when refinement bailed out rather than converging. The mesh is
     /// still valid, but does not meet the requested quality everywhere.
     pub terminated_early: bool,
+    /// How many elements refinement could not improve to the requested quality.
+    ///
+    /// Zero unless the outcome is `left_unimprovable`. Distinct from the count
+    /// of elements below the target angle, which is a property of the finished
+    /// mesh: this is how many times refinement ran out of moves, and it is the
+    /// number that says the target is unreachable rather than merely unmet.
+    pub unimprovable_elements: usize,
     pub outcome: String,
     /// False when the quality target sits outside Ruppert's provable
     /// termination regime, i.e. above roughly 20.7 degrees. Best-effort there.
@@ -243,6 +250,7 @@ fn outcome_label(outcome: RefineOutcome) -> &'static str {
         RefineOutcome::Converged => "converged",
         RefineOutcome::HitStepLimit => "hit_step_limit",
         RefineOutcome::HitSizeLimit => "hit_size_limit",
+        RefineOutcome::LeftUnimprovable(_) => "left_unimprovable",
     }
 }
 
@@ -330,6 +338,10 @@ pub fn build_mesh(request: MeshRequest) -> Result<MeshResponse, String> {
         triangles: mesh.triangles.clone(),
         vertices,
         terminated_early: outcome.terminated_early(),
+        unimprovable_elements: match outcome {
+            RefineOutcome::LeftUnimprovable(count) => count,
+            _ => 0,
+        },
         outcome: outcome_label(outcome).to_string(),
         provable_termination,
     })
