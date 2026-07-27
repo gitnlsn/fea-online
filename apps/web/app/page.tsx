@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AngleHistogram } from "../components/AngleHistogram";
-import { MeshCanvas, WORLD_SIZE } from "../components/MeshCanvas";
+import { MeshCanvas } from "../components/MeshCanvas";
 import { meshRequestKey, useMesher } from "../hooks/useMesher";
+import { WORLD_SIZE } from "../lib/viewport";
 import {
   download,
   parseGeometryJson,
@@ -275,8 +276,9 @@ export default function Page() {
 
             {mode !== "idle" && (
               <p className="mt-2 text-xs" style={{ color: "var(--text-secondary)" }}>
-                Click to place points. Click the first point again (or press Enter)
-                to close the loop. Escape cancels.
+                Click to place points. Points snap to the grid and to the last
+                point&apos;s axis — hold Alt to place freely. Click the first point
+                again (or press Enter) to close the loop. Escape cancels.
               </p>
             )}
 

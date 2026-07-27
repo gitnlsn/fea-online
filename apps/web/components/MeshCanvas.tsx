@@ -1,7 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Loop, MeshResponse, Point } from "../lib/mesh";
+import {
+  computeTransform,
+  labelStep,
+  MAJOR_STEP,
+  MINOR_STEP,
+  snapPoint,
+  toScreen,
+  toWorld,
+  WORLD_SIZE,
+  type Transform,
+} from "../lib/viewport";
 
 /** Sequential blue ramp: element quality, low angle to high angle. */
 const QUALITY_RAMP = [
@@ -16,39 +27,11 @@ const QUALITY_RAMP = [
 
 const STATUS_CRITICAL = "#d03b3b";
 
-/** World extent shown in the viewport. Geometry is authored inside this box. */
-export const WORLD_SIZE = 100;
-
 /** Screen radius, in CSS pixels, for snapping a click to the first vertex. */
 const CLOSE_SNAP_PX = 10;
 
-interface Transform {
-  scale: number;
-  offsetX: number;
-  offsetY: number;
-}
-
-function computeTransform(width: number, height: number): Transform {
-  const padding = 24;
-  const scale = Math.min(
-    (width - padding * 2) / WORLD_SIZE,
-    (height - padding * 2) / WORLD_SIZE,
-  );
-  return {
-    scale,
-    offsetX: (width - WORLD_SIZE * scale) / 2,
-    // Flipped so y increases upward, as geometry conventionally does.
-    offsetY: height - (height - WORLD_SIZE * scale) / 2,
-  };
-}
-
-function toScreen(point: Point, t: Transform): [number, number] {
-  return [point[0] * t.scale + t.offsetX, t.offsetY - point[1] * t.scale];
-}
-
-function toWorld(x: number, y: number, t: Transform): Point {
-  return [(x - t.offsetX) / t.scale, (t.offsetY - y) / t.scale];
-}
+/** Length of a ruler tick outside the plot box, in CSS pixels. */
+const TICK_PX = 4;
 
 function qualityColor(minAngleDeg: number, targetDeg: number): string {
   // Elements that miss the requested quality are called out in the reserved
@@ -107,6 +90,34 @@ export function MeshCanvas({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const transformRef = useRef<Transform>({ scale: 1, offsetX: 0, offsetY: 0 });
 
+  /**
+   * Alt releases snapping. Held in state rather than read off each mouse event
+   * alone, because pressing the key without moving the mouse still has to
+   * redraw -- otherwise the rubber band keeps showing a snapped preview that no
+   * longer matches where a click would land.
+   */
+  const [altHeld, setAltHeld] = useState(false);
+  const snapEnabled = !altHeld;
+
+  /** The point a segment is being drawn from, and so what ortho locks against. */
+  const anchor = draft.length > 0 ? draft[draft.length - 1] : null;
+
+  /**
+   * Axis the pending segment runs along, or null if it is not axis-aligned.
+   *
+   * Derived from the cursor already in state rather than remembered from the
+   * last snap, so the guide line can never disagree with the rubber band it is
+   * meant to explain.
+   */
+  const orthoAxis =
+    anchor && cursor && snapEnabled
+      ? cursor[1] === anchor[1]
+        ? "x"
+        : cursor[0] === anchor[0]
+          ? "y"
+          : null
+      : null;
+
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -139,38 +150,81 @@ export function MeshCanvas({
     const series = styles.getPropertyValue("--series-1").trim() || "#2a78d6";
     const surface = styles.getPropertyValue("--surface").trim() || "#fcfcfb";
     const primary = styles.getPropertyValue("--text-primary").trim() || "#0b0b0b";
+    const muted = styles.getPropertyValue("--text-muted").trim() || "#898781";
 
     const transform = computeTransform(cssWidth, cssHeight);
     transformRef.current = transform;
 
-    // --- recessive grid ---
-    context.strokeStyle = gridline;
-    context.lineWidth = 1;
-    context.beginPath();
-    for (let i = 0; i <= WORLD_SIZE; i += 10) {
-      const [xa, ya] = toScreen([i, 0], transform);
-      const [xb, yb] = toScreen([i, WORLD_SIZE], transform);
-      context.moveTo(xa, ya);
-      context.lineTo(xb, yb);
+    const [ox, oy] = toScreen([0, 0], transform);
+    const [ex, ey] = toScreen([WORLD_SIZE, WORLD_SIZE], transform);
 
-      const [xc, yc] = toScreen([0, i], transform);
-      const [xd, yd] = toScreen([WORLD_SIZE, i], transform);
-      context.moveTo(xc, yc);
-      context.lineTo(xd, yd);
-    }
-    context.stroke();
+    // --- recessive grid ---
+    // Minor lines sit between the labelled ones so a one-unit snap has
+    // something to be read against; they are drawn faintly enough to stay
+    // background texture rather than competing with the mesh.
+    const gridPass = (step: number, alpha: number) => {
+      context.strokeStyle = gridline;
+      context.globalAlpha = alpha;
+      context.lineWidth = 1;
+      context.beginPath();
+      for (let i = 0; i <= WORLD_SIZE; i += step) {
+        if (step === MINOR_STEP && i % MAJOR_STEP === 0) continue;
+        const [x] = toScreen([i, 0], transform);
+        context.moveTo(x, oy);
+        context.lineTo(x, ey);
+
+        const [, y] = toScreen([0, i], transform);
+        context.moveTo(ox, y);
+        context.lineTo(ex, y);
+      }
+      context.stroke();
+      context.globalAlpha = 1;
+    };
+
+    gridPass(MINOR_STEP, 0.45);
+    gridPass(MAJOR_STEP, 1);
 
     context.strokeStyle = baseline;
     context.lineWidth = 1;
-    const [ox, oy] = toScreen([0, 0], transform);
-    const [ex] = toScreen([WORLD_SIZE, 0], transform);
-    const [, ey] = toScreen([0, WORLD_SIZE], transform);
     context.beginPath();
     context.moveTo(ox, oy);
     context.lineTo(ex, oy);
     context.moveTo(ox, oy);
     context.lineTo(ox, ey);
     context.stroke();
+
+    // --- rulers ---
+    // Ticks mark every major grid line; only the numbers thin out as the canvas
+    // narrows, so the scale stays readable even where a label was dropped.
+    const numberEvery = labelStep(transform.scale);
+
+    context.strokeStyle = baseline;
+    context.lineWidth = 1;
+    context.beginPath();
+    for (let i = 0; i <= WORLD_SIZE; i += MAJOR_STEP) {
+      const [x] = toScreen([i, 0], transform);
+      context.moveTo(x, oy);
+      context.lineTo(x, oy + TICK_PX);
+
+      const [, y] = toScreen([0, i], transform);
+      context.moveTo(ox, y);
+      context.lineTo(ox - TICK_PX, y);
+    }
+    context.stroke();
+
+    context.fillStyle = muted;
+    context.font = "10px system-ui, -apple-system, sans-serif";
+    for (let i = 0; i <= WORLD_SIZE; i += numberEvery) {
+      const [x] = toScreen([i, 0], transform);
+      context.textAlign = "center";
+      context.textBaseline = "top";
+      context.fillText(String(i), x, oy + TICK_PX + 3);
+
+      const [, y] = toScreen([0, i], transform);
+      context.textAlign = "right";
+      context.textBaseline = "middle";
+      context.fillText(String(i), ox - TICK_PX - 3, y);
+    }
 
     // --- mesh ---
     if (mesh && showMesh) {
@@ -258,6 +312,27 @@ export function MeshCanvas({
     if (boundary) strokeLoop(boundary, series, 2);
     holes.forEach((hole) => strokeLoop(hole, series, 2));
 
+    // --- ortho guide ---
+    // A snap the user cannot see reads as the tool moving their point for no
+    // reason, so the locked axis is drawn as a full-width dashed line.
+    if (anchor && orthoAxis) {
+      const [ax, ay] = toScreen(anchor, transform);
+      context.save();
+      context.strokeStyle = baseline;
+      context.lineWidth = 1;
+      context.setLineDash([4, 4]);
+      context.beginPath();
+      if (orthoAxis === "x") {
+        context.moveTo(ox, ay);
+        context.lineTo(ex, ay);
+      } else {
+        context.moveTo(ax, oy);
+        context.lineTo(ax, ey);
+      }
+      context.stroke();
+      context.restore();
+    }
+
     // --- in-progress draft ---
     if (draft.length > 0) {
       context.strokeStyle = series;
@@ -295,7 +370,19 @@ export function MeshCanvas({
         context.stroke();
       }
     }
-  }, [boundary, holes, draft, cursor, mesh, minAngleDeg, showMesh, stale, selectedRange]);
+  }, [
+    boundary,
+    holes,
+    draft,
+    cursor,
+    mesh,
+    minAngleDeg,
+    showMesh,
+    stale,
+    selectedRange,
+    anchor,
+    orthoAxis,
+  ]);
 
   useEffect(() => {
     draw();
@@ -308,26 +395,58 @@ export function MeshCanvas({
     return () => observer.disconnect();
   }, [draw]);
 
+  useEffect(() => {
+    const sync = (event: KeyboardEvent) => setAltHeld(event.altKey);
+    // Alt-tabbing away leaves the keyup unheard, which would strand snapping in
+    // the released state until the key is pressed and let go again.
+    const release = () => setAltHeld(false);
+
+    window.addEventListener("keydown", sync);
+    window.addEventListener("keyup", sync);
+    window.addEventListener("blur", release);
+    return () => {
+      window.removeEventListener("keydown", sync);
+      window.removeEventListener("keyup", sync);
+      window.removeEventListener("blur", release);
+    };
+  }, []);
+
+  /**
+   * Where a click at these canvas coordinates would actually place a point.
+   *
+   * Shared by the click and move handlers so the rubber-band preview and the
+   * committed point can never differ.
+   */
+  const resolve = (event: React.MouseEvent<HTMLCanvasElement>): Point => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const transform = transformRef.current;
+    const raw = toWorld(event.clientX - rect.left, event.clientY - rect.top, transform);
+    // `event.altKey` rather than the tracked state: the event is the newer of
+    // the two when a mouse move and a key press race.
+    return snapPoint(raw, anchor, transform.scale, !event.altKey).point;
+  };
+
   const handleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    const world = toWorld(x, y, transformRef.current);
 
-    let snapped = false;
+    // Closing the loop is checked against the raw pointer position and takes
+    // priority: snapping must not be able to pull a click off the first vertex
+    // and quietly add a duplicate point instead of finishing the loop.
     if (draft.length >= 3) {
       const [sx, sy] = toScreen(draft[0], transformRef.current);
-      snapped = Math.hypot(sx - x, sy - y) <= CLOSE_SNAP_PX;
+      if (Math.hypot(sx - x, sy - y) <= CLOSE_SNAP_PX) {
+        onCanvasClick(draft[0], true);
+        return;
+      }
     }
 
-    onCanvasClick(world, snapped);
+    onCanvasClick(resolve(event), false);
   };
 
   const handleMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    onCursorMove(
-      toWorld(event.clientX - rect.left, event.clientY - rect.top, transformRef.current),
-    );
+    onCursorMove(resolve(event));
   };
 
   return (
