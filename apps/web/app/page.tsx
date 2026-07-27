@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AngleHistogram } from "../components/AngleHistogram";
-import { MeshCanvas } from "../components/MeshCanvas";
+import { FieldLegend } from "../components/FieldLegend";
+import { MeshCanvas, type EdgeRef } from "../components/MeshCanvas";
 import { meshRequestKey, useMesher } from "../hooks/useMesher";
+import { useSolver } from "../hooks/useSolver";
 import { WORLD_SIZE } from "../lib/viewport";
 import {
   download,
@@ -11,8 +13,24 @@ import {
   toGeometryJson,
   toGmsh,
   toVtk,
+  toVtkField,
 } from "../lib/export";
 import { loopCornerAngles, validateLoop, type Loop, type Point } from "../lib/mesh";
+import {
+  buildSolveGeometry,
+  conditionFor,
+  DEFAULT_CONDITION,
+  loopEntries,
+  NO_CONDITIONS,
+  reconcileConditions,
+  solveRequestKey,
+  subdivisionsFor,
+  type BoundaryConditions,
+  type ConditionKind,
+  type ConditionValue,
+  type EdgeKey,
+  type LoopKey,
+} from "../lib/solve";
 
 type Mode = "idle" | "boundary" | "hole";
 
@@ -57,7 +75,26 @@ export default function Page() {
   const [selectedBucket, setSelectedBucket] = useState<[number, number] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  // What the editors write to. Read through the reconciled `conditions` below,
+  // never directly: this can still name a loop that has since been redrawn.
+  const [storedConditions, setConditions] = useState<BoundaryConditions>(NO_CONDITIONS);
+  const [storedSelectedEdge, setSelectedEdge] = useState<EdgeRef | null>(null);
+  const [editingConditions, setEditingConditions] = useState(false);
+  const [conductivity, setConductivity] = useState(1);
+  const [sourceValue, setSourceValue] = useState(0);
+  const [degree, setDegree] = useState(1);
+  const [showField, setShowField] = useState(true);
+
   const { status, mesh, error, elapsedMs, meshKey, run, clear } = useMesher();
+  const {
+    status: solveStatus,
+    solution,
+    error: solveError,
+    elapsedMs: solveElapsedMs,
+    solutionKey,
+    run: runSolve,
+    clear: clearSolution,
+  } = useSolver();
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const geometryError = useMemo(() => {
@@ -140,6 +177,120 @@ export default function Page() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [boundary, holes, minAngleDeg, maxArea, geometryError, run, clear]);
+
+  /**
+   * The conditions as they apply to the geometry currently drawn.
+   *
+   * Derived rather than kept in sync by an effect. Conditions outlive individual
+   * edits -- a loop-level condition survives its loop being redrawn -- so the
+   * two can disagree, and reconciling on read means they cannot disagree for
+   * even one render. Editors write to `storedConditions`; everything that
+   * *reads* a condition reads this.
+   */
+  const conditions = useMemo(
+    () => reconcileConditions(boundary, holes, storedConditions),
+    [boundary, holes, storedConditions],
+  );
+
+  /** A selection against edges that no longer exist names nothing. */
+  const selectedEdge = useMemo(() => {
+    if (!storedSelectedEdge) return null;
+    const found = loopEntries(boundary, holes).find(
+      (entry) => entry.key === storedSelectedEdge.key,
+    );
+    return found && storedSelectedEdge.edge < found.loop.length ? storedSelectedEdge : null;
+  }, [storedSelectedEdge, boundary, holes]);
+
+  /** The problem as currently stated, or null when there is nothing to solve. */
+  const solveRequest = useMemo(() => {
+    if (!mesh || !boundary || geometryError) return null;
+
+    return {
+      vertices: mesh.vertices,
+      triangles: mesh.triangles,
+      ...buildSolveGeometry(boundary, holes, conditions),
+      conductivity,
+      source: { kind: "constant" as const, value: sourceValue },
+      degree,
+      tolerance: 1e-10,
+      max_iterations: 5_000,
+      subdivisions: subdivisionsFor(degree),
+    };
+  }, [mesh, boundary, holes, geometryError, conditions, conductivity, sourceValue, degree]);
+
+  /**
+   * Whether the field on screen still answers the problem currently stated.
+   *
+   * The same reasoning as `meshIsStale`, one layer up: a field is kept on screen
+   * while the next solve runs, and while conditions are being edited, so it can
+   * outlive the problem that produced it. A correct answer to the previous
+   * question looks exactly like a wrong answer to this one.
+   */
+  const solutionIsStale = useMemo(() => {
+    if (!solution || !solutionKey || !solveRequest || !meshKey) return false;
+    return solutionKey !== solveRequestKey(solveRequest, meshKey);
+  }, [solution, solutionKey, solveRequest, meshKey]);
+
+  // A field computed on geometry that has since been replaced is not stale, it
+  // is meaningless -- there is nothing left for it to be drawn against.
+  useEffect(() => {
+    if (!boundary) clearSolution();
+  }, [boundary, clearSolution]);
+
+  const canSolve =
+    solveRequest !== null && !meshIsStale && solveStatus !== "solving" && !geometryError;
+
+  const handleSolve = useCallback(() => {
+    if (!solveRequest || !meshKey) return;
+    runSolve(solveRequest, meshKey);
+  }, [solveRequest, meshKey, runSolve]);
+
+  const setLoopCondition = useCallback((key: LoopKey, next: ConditionValue) => {
+    setConditions((previous) => ({
+      ...previous,
+      loops: { ...previous.loops, [key]: next },
+    }));
+  }, []);
+
+  const setEdgeCondition = useCallback((key: EdgeKey, next: ConditionValue) => {
+    setConditions((previous) => ({
+      ...previous,
+      edges: { ...previous.edges, [key]: next },
+    }));
+  }, []);
+
+  const clearEdgeCondition = useCallback((key: EdgeKey) => {
+    setConditions((previous) => {
+      const edges = { ...previous.edges };
+      delete edges[key];
+      return { ...previous, edges };
+    });
+  }, []);
+
+  /**
+   * Clicking an edge splits it out of its loop's group.
+   *
+   * The override is seeded from whatever the edge already resolves to, so
+   * selecting an edge never changes the problem -- only what can be edited.
+   */
+  const handleEdgePick = useCallback(
+    (picked: EdgeRef) => {
+      setSelectedEdge(picked);
+      const key = `${picked.key}:${picked.edge}` as EdgeKey;
+      setConditions((previous) =>
+        previous.edges[key]
+          ? previous
+          : {
+              ...previous,
+              edges: {
+                ...previous.edges,
+                [key]: { ...conditionFor(previous, picked.key, picked.edge) },
+              },
+            },
+      );
+    },
+    [],
+  );
 
   const handleCanvasClick = useCallback(
     (point: Point, snappedToStart: boolean) => {
@@ -226,6 +377,14 @@ export default function Page() {
               draft={draft}
               cursor={cursor}
               mesh={mesh}
+              solution={solution}
+              showField={showField}
+              fieldStale={solutionIsStale}
+              // Drawing and condition-editing are mutually exclusive: a click
+              // has to mean exactly one thing.
+              edgePickEnabled={editingConditions && mode === "idle"}
+              selectedEdge={selectedEdge}
+              onEdgePick={handleEdgePick}
               minAngleDeg={minAngleDeg}
               showMesh={showMesh}
               stale={meshIsStale}
@@ -508,6 +667,175 @@ export default function Page() {
             </section>
           )}
 
+          {/* --- boundary conditions --- */}
+          {boundary && (
+            <section className="space-y-2">
+              <h2
+                className="flex items-baseline justify-between text-xs font-semibold tracking-wide uppercase"
+                style={{ color: "var(--text-muted)" }}
+              >
+                <span>Boundary conditions</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingConditions((previous) => !previous);
+                    setSelectedEdge(null);
+                  }}
+                  className="normal-case underline"
+                  style={{
+                    color: editingConditions ? "var(--series-1)" : "var(--text-muted)",
+                  }}
+                >
+                  {editingConditions ? "done" : "pick edges"}
+                </button>
+              </h2>
+
+              {editingConditions && (
+                <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  Click an edge on the canvas to give it its own condition. Until
+                  then every edge of a loop shares the loop&apos;s.
+                </p>
+              )}
+
+              {loopEntries(boundary, holes).map(({ key, loop }) => {
+                const overrides = Array.from({ length: loop.length }, (_, edge) => edge).filter(
+                  (edge) => conditions.edges[`${key}:${edge}` as EdgeKey] !== undefined,
+                );
+
+                return (
+                  <div key={key} className="space-y-1.5">
+                    <ConditionRow
+                      label={key === "boundary" ? "Outer boundary" : `Hole ${Number(key.split(":")[1]) + 1}`}
+                      value={conditions.loops[key] ?? DEFAULT_CONDITION}
+                      onChange={(next) => setLoopCondition(key, next)}
+                    />
+                    {overrides.map((edge) => {
+                      const edgeKey = `${key}:${edge}` as EdgeKey;
+                      return (
+                        <ConditionRow
+                          key={edgeKey}
+                          label={`Edge ${edge + 1}`}
+                          nested
+                          highlighted={
+                            selectedEdge?.key === key && selectedEdge.edge === edge
+                          }
+                          value={conditions.edges[edgeKey] ?? DEFAULT_CONDITION}
+                          onChange={(next) => setEdgeCondition(edgeKey, next)}
+                          onRemove={() => {
+                            clearEdgeCondition(edgeKey);
+                            if (selectedEdge?.key === key && selectedEdge.edge === edge) {
+                              setSelectedEdge(null);
+                            }
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </section>
+          )}
+
+          {/* --- solve --- */}
+          {boundary && (
+            <section className="space-y-3">
+              <h2
+                className="flex items-baseline justify-between text-xs font-semibold tracking-wide uppercase"
+                style={{ color: "var(--text-muted)" }}
+              >
+                <span>Solve</span>
+                {solution && solutionIsStale && (
+                  <button
+                    type="button"
+                    onClick={handleSolve}
+                    disabled={!canSolve}
+                    className="normal-case underline disabled:opacity-40"
+                    style={{ color: "var(--status-warning)" }}
+                  >
+                    out of date — re-solve
+                  </button>
+                )}
+              </h2>
+
+              <div className="grid grid-cols-2 gap-2">
+                <NumberField
+                  label="Conductivity k"
+                  value={conductivity}
+                  min={1e-9}
+                  onChange={setConductivity}
+                />
+                <NumberField label="Source s" value={sourceValue} onChange={setSourceValue} />
+              </div>
+
+              <label className="block">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                    Polynomial degree
+                  </span>
+                  <span className="tabular text-xs font-medium">p = {degree}</span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={4}
+                  step={1}
+                  value={degree}
+                  onChange={(event) => setDegree(Number(event.target.value))}
+                  className="mt-1 w-full accent-[var(--series-1)]"
+                />
+              </label>
+
+              <button
+                type="button"
+                onClick={handleSolve}
+                disabled={!canSolve}
+                className="w-full rounded border px-2 py-1.5 text-xs transition-colors disabled:opacity-40"
+                style={{
+                  borderColor: canSolve ? "var(--series-1)" : "var(--border)",
+                  color: canSolve ? "var(--series-1)" : "var(--text-muted)",
+                }}
+              >
+                {solveStatus === "solving"
+                  ? "Solving…"
+                  : meshIsStale
+                    ? "Waiting for the mesh…"
+                    : "Solve"}
+              </button>
+
+              {solution && (
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={showField}
+                    onChange={(event) => setShowField(event.target.checked)}
+                    className="accent-[var(--series-1)]"
+                  />
+                  <span style={{ color: "var(--text-secondary)" }}>Show field</span>
+                </label>
+              )}
+
+              {solveError && (
+                <div
+                  className="rounded border p-2 text-xs"
+                  style={{
+                    borderColor: "var(--status-critical)",
+                    color: "var(--status-critical)",
+                  }}
+                >
+                  <strong>Solve failed.</strong> {solveError}
+                </div>
+              )}
+
+              {solution && (
+                <FieldLegend
+                  solution={solution}
+                  stale={solutionIsStale}
+                  elapsedMs={solveElapsedMs}
+                />
+              )}
+            </section>
+          )}
+
           {/* --- export --- */}
           <section>
             <h2
@@ -526,6 +854,11 @@ export default function Page() {
                 label="VTK .vtk"
                 disabled={!mesh}
                 onClick={() => mesh && download("mesh.vtk", toVtk(mesh))}
+              />
+              <ExportButton
+                label="Solution .vtk"
+                disabled={!solution}
+                onClick={() => solution && download("solution.vtk", toVtkField(solution))}
               />
               <ExportButton
                 label="Geometry .json"
@@ -631,6 +964,154 @@ function ExportButton({
     >
       {label}
     </button>
+  );
+}
+
+function NumberField({
+  label,
+  value,
+  min,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min?: number;
+  onChange: (next: number) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+        {label}
+      </span>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        step="any"
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          // A half-typed number briefly parses as NaN, which the solver would
+          // reject; holding the last good value keeps the field editable.
+          if (Number.isFinite(next)) onChange(next);
+        }}
+        className="tabular mt-0.5 w-full rounded border bg-transparent px-1.5 py-1 text-xs"
+        style={{ borderColor: "var(--border)" }}
+      />
+    </label>
+  );
+}
+
+/**
+ * One boundary condition: which kind, and its data.
+ *
+ * The labels state the physics rather than the name of the mathematician. A
+ * Neumann value here is the outward *flux* `J·n`, which for diffusion is
+ * `-k du/dn` -- the opposite sign to the derivative, and the single easiest
+ * thing to get backwards, because a sign error still converges beautifully to
+ * the wrong answer.
+ */
+function ConditionRow({
+  label,
+  value,
+  nested,
+  highlighted,
+  onChange,
+  onRemove,
+}: {
+  label: string;
+  value: ConditionValue;
+  nested?: boolean;
+  highlighted?: boolean;
+  onChange: (next: ConditionValue) => void;
+  onRemove?: () => void;
+}) {
+  const kinds: { kind: ConditionKind; label: string; hint: string }[] = [
+    { kind: "dirichlet", label: "Fixed value", hint: "u =" },
+    { kind: "neumann", label: "Fixed flux", hint: "J·n =" },
+    { kind: "robin", label: "Convective", hint: "k du/dn + c·u =" },
+  ];
+
+  return (
+    <div
+      className={`rounded border p-1.5 ${nested ? "ml-3" : ""}`}
+      style={{
+        borderColor: highlighted ? "var(--series-1)" : "var(--border)",
+      }}
+    >
+      <div className="flex items-baseline justify-between">
+        <span className="text-[11px] font-medium">{label}</span>
+        {onRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="text-[11px] underline"
+            style={{ color: "var(--text-muted)" }}
+          >
+            remove
+          </button>
+        )}
+      </div>
+
+      <select
+        value={value.kind}
+        onChange={(event) =>
+          onChange({ ...value, kind: event.target.value as ConditionKind })
+        }
+        className="mt-1 w-full rounded border bg-transparent px-1 py-0.5 text-xs"
+        style={{ borderColor: "var(--border)", color: "var(--text-primary)" }}
+      >
+        {kinds.map((entry) => (
+          <option key={entry.kind} value={entry.kind}>
+            {entry.label}
+          </option>
+        ))}
+      </select>
+
+      <div className="mt-1 flex items-center gap-1.5">
+        <span
+          className="shrink-0 text-[11px] whitespace-nowrap"
+          style={{ color: "var(--text-muted)" }}
+        >
+          {kinds.find((entry) => entry.kind === value.kind)?.hint}
+        </span>
+        <input
+          type="number"
+          step="any"
+          value={value.value}
+          onChange={(event) => {
+            const next = Number(event.target.value);
+            if (Number.isFinite(next)) onChange({ ...value, value: next });
+          }}
+          className="tabular min-w-0 flex-1 rounded border bg-transparent px-1.5 py-0.5 text-xs"
+          style={{ borderColor: "var(--border)" }}
+        />
+      </div>
+
+      {value.kind === "robin" && (
+        <div className="mt-1 flex items-center gap-1.5">
+          <span className="shrink-0 text-[11px]" style={{ color: "var(--text-muted)" }}>
+            c =
+          </span>
+          <input
+            type="number"
+            step="any"
+            min={1e-9}
+            value={value.coefficient}
+            onChange={(event) => {
+              const next = Number(event.target.value);
+              if (Number.isFinite(next)) onChange({ ...value, coefficient: next });
+            }}
+            className="tabular min-w-0 flex-1 rounded border bg-transparent px-1.5 py-0.5 text-xs"
+            style={{
+              // The solver refuses a non-positive coefficient, so say so here
+              // rather than letting the request come back as an error.
+              borderColor:
+                value.coefficient > 0 ? "var(--border)" : "var(--status-critical)",
+            }}
+          />
+        </div>
+      )}
+    </div>
   );
 }
 

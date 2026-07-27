@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Loop, MeshResponse, Point } from "../lib/mesh";
+import { fieldColor, fieldScale } from "../lib/fieldRamp";
+import type { LoopKey, SolveResponse } from "../lib/solve";
 import {
   computeTransform,
   labelStep,
   MAJOR_STEP,
   MINOR_STEP,
+  pickEdge,
   snapPoint,
   toScreen,
   toWorld,
@@ -33,6 +36,59 @@ const CLOSE_SNAP_PX = 10;
 /** Length of a ruler tick outside the plot box, in CSS pixels. */
 const TICK_PX = 4;
 
+/**
+ * Rasterises the sampled field into `context`.
+ *
+ * Kept out of the main draw so it can go to an offscreen buffer, and written
+ * against raw numbers rather than the `toScreen` helper: it runs once per
+ * element per sub-triangle, and the helper allocates a tuple on every call.
+ */
+function paintField(
+  context: CanvasRenderingContext2D,
+  solution: SolveResponse,
+  t: Transform,
+  neutral: string,
+) {
+  const { positions, values, sub_triangles, sample_stride } = solution;
+  const scale = fieldScale(solution.min_value, solution.max_value);
+
+  for (let element = 0; element < solution.element_count; element++) {
+    const base = element * sample_stride;
+
+    for (let corner = 0; corner < sub_triangles.length; corner += 3) {
+      const a = (base + sub_triangles[corner]) * 2;
+      const b = (base + sub_triangles[corner + 1]) * 2;
+      const c = (base + sub_triangles[corner + 2]) * 2;
+
+      context.beginPath();
+      context.moveTo(positions[a] * t.scale + t.offsetX, t.offsetY - positions[a + 1] * t.scale);
+      context.lineTo(positions[b] * t.scale + t.offsetX, t.offsetY - positions[b + 1] * t.scale);
+      context.lineTo(positions[c] * t.scale + t.offsetX, t.offsetY - positions[c + 1] * t.scale);
+      context.closePath();
+
+      // The sub-triangle takes one colour, from the mean of its corners. A flat
+      // fill of a sampled polynomial is what "subdivide until flat is close
+      // enough" means; averaging the corners rather than taking one of them
+      // keeps the fill centred on the patch it covers.
+      const value =
+        (values[base + sub_triangles[corner]] +
+          values[base + sub_triangles[corner + 1]] +
+          values[base + sub_triangles[corner + 2]]) /
+        3;
+      const color = fieldColor(value, scale, neutral);
+
+      context.fillStyle = color;
+      context.fill();
+      // Antialiasing leaves a hairline of background between adjacent fills,
+      // which reads as a crack in the solution rather than as a canvas
+      // artefact. Stroking the same path in the same colour closes it.
+      context.strokeStyle = color;
+      context.lineWidth = 0.5;
+      context.stroke();
+    }
+  }
+}
+
 function qualityColor(minAngleDeg: number, targetDeg: number): string {
   // Elements that miss the requested quality are called out in the reserved
   // status colour. The stats panel always shows the matching count and label,
@@ -50,12 +106,36 @@ function qualityColor(minAngleDeg: number, targetDeg: number): string {
   return QUALITY_RAMP[index];
 }
 
+/** An edge of a drawn loop, as the boundary-condition editor identifies it. */
+export interface EdgeRef {
+  key: LoopKey;
+  edge: number;
+}
+
 interface MeshCanvasProps {
   boundary: Loop | null;
   holes: Loop[];
   draft: Point[];
   cursor: Point | null;
   mesh: MeshResponse | null;
+  /**
+   * The solved field, sampled for display. Drawn beneath the mesh, and
+   * suppresses the mesh's own quality fill while it is showing: two sequential
+   * fills in the same pixels answer different questions and neither survives
+   * being read through the other.
+   */
+  solution: SolveResponse | null;
+  showField: boolean;
+  /**
+   * The field belongs to a problem that has since changed -- different
+   * conditions, or a different mesh. Drawn faintly for the same reason a stale
+   * mesh is.
+   */
+  fieldStale: boolean;
+  /** Clicking an edge selects it, rather than placing a geometry point. */
+  edgePickEnabled: boolean;
+  selectedEdge: EdgeRef | null;
+  onEdgePick: (edge: EdgeRef) => void;
   minAngleDeg: number;
   showMesh: boolean;
   /**
@@ -80,6 +160,12 @@ export function MeshCanvas({
   draft,
   cursor,
   mesh,
+  solution,
+  showField,
+  fieldStale,
+  edgePickEnabled,
+  selectedEdge,
+  onEdgePick,
   minAngleDeg,
   showMesh,
   stale,
@@ -89,6 +175,35 @@ export function MeshCanvas({
 }: MeshCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const transformRef = useRef<Transform>({ scale: 1, offsetX: 0, offsetY: 0 });
+
+  /**
+   * The field, rasterised once and blitted thereafter.
+   *
+   * `draw` re-runs on every mouse move, because the rubber band depends on the
+   * cursor. A field at a few thousand elements is tens of thousands of filled
+   * paths, which is far too much to repaint at pointer rate -- so it is drawn
+   * into an offscreen canvas and invalidated only when the field or the
+   * viewport actually changes.
+   */
+  const fieldCacheRef = useRef<{ key: string; canvas: HTMLCanvasElement } | null>(null);
+
+  /**
+   * The edge the pointer is over.
+   *
+   * State rather than a ref, even though the move handler fires at pointer rate:
+   * the handler only calls the setter when the hovered edge actually *changes*,
+   * so this re-renders on the order of once per edge crossed, and both the
+   * highlight and the cursor swap follow from it without a manual repaint.
+   */
+  const [hoveredEdge, setHoveredEdge] = useState<EdgeRef | null>(null);
+
+  const loops = useMemo(
+    () => [
+      ...(boundary ? [{ key: "boundary" as LoopKey, loop: boundary }] : []),
+      ...holes.map((hole, index) => ({ key: `hole:${index}` as LoopKey, loop: hole })),
+    ],
+    [boundary, holes],
+  );
 
   /**
    * Alt releases snapping. Held in state rather than read off each mouse event
@@ -226,6 +341,46 @@ export function MeshCanvas({
       context.fillText(String(i), ox - TICK_PX - 3, y);
     }
 
+    // --- solution field ---
+    // Drawn under the mesh so element edges read as an overlay on the field
+    // rather than the field bleeding over them.
+    const fieldShowing = solution !== null && showField;
+    if (fieldShowing) {
+      const neutral = styles.getPropertyValue("--div-mid").trim() || "#f0efec";
+      const cacheKey = JSON.stringify([
+        solution.positions.length,
+        solution.min_value,
+        solution.max_value,
+        solution.element_count,
+        solution.subdivisions,
+        transform,
+        neutral,
+        ratio,
+        cssWidth,
+        cssHeight,
+      ]);
+
+      let cached = fieldCacheRef.current;
+      if (!cached || cached.key !== cacheKey) {
+        const buffer = document.createElement("canvas");
+        buffer.width = cssWidth * ratio;
+        buffer.height = cssHeight * ratio;
+        const target = buffer.getContext("2d");
+        if (target) {
+          target.setTransform(ratio, 0, 0, ratio, 0, 0);
+          paintField(target, solution, transform, neutral);
+        }
+        cached = { key: cacheKey, canvas: buffer };
+        fieldCacheRef.current = cached;
+      }
+
+      // A field on a stale mesh is at least as out of date as the mesh, so the
+      // two flags compound rather than one overriding the other.
+      context.globalAlpha = fieldStale || stale ? 0.2 : 1;
+      context.drawImage(cached.canvas, 0, 0, cssWidth, cssHeight);
+      context.globalAlpha = 1;
+    }
+
     // --- mesh ---
     if (mesh && showMesh) {
       const { vertices, triangles, min_angles_deg } = mesh;
@@ -262,14 +417,25 @@ export function MeshCanvas({
         // stays readable as context around the selection.
         const selectionAlpha = selectedRange === null || inSelection ? 1 : 0.25;
         context.globalAlpha = stale ? selectionAlpha * 0.2 : selectionAlpha;
-        context.fillStyle = qualityColor(angle, minAngleDeg);
-        context.fill();
 
-        // A hairline in the surface colour separates adjacent fills, so element
-        // boundaries stay legible without a heavy wireframe.
-        context.strokeStyle = surface;
-        context.lineWidth = 0.5;
-        context.stroke();
+        if (!fieldShowing) {
+          context.fillStyle = qualityColor(angle, minAngleDeg);
+          context.fill();
+
+          // A hairline in the surface colour separates adjacent fills, so
+          // element boundaries stay legible without a heavy wireframe.
+          context.strokeStyle = surface;
+          context.lineWidth = 0.5;
+          context.stroke();
+        } else {
+          // Over a field the wireframe is all that is left of the mesh, and it
+          // has to stay recessive: element edges are context here, not the
+          // subject.
+          context.strokeStyle = baseline;
+          context.lineWidth = 0.5;
+          context.globalAlpha *= 0.5;
+          context.stroke();
+        }
         context.globalAlpha = 1;
       }
 
@@ -311,6 +477,34 @@ export function MeshCanvas({
 
     if (boundary) strokeLoop(boundary, series, 2);
     holes.forEach((hole) => strokeLoop(hole, series, 2));
+
+    // --- picked edges ---
+    // Drawn over the outlines rather than instead of them, so an edge under the
+    // pointer reads as a highlight on the loop rather than as a break in it. A
+    // pickable target the user cannot see is the same problem the ortho guide
+    // exists to solve.
+    if (edgePickEnabled) {
+      const highlight = (edge: EdgeRef | null, color: string, width: number) => {
+        if (!edge) return;
+        const found = loops.find((entry) => entry.key === edge.key);
+        if (!found || edge.edge >= found.loop.length) return;
+
+        const [ax, ay] = toScreen(found.loop[edge.edge], transform);
+        const [bx, by] = toScreen(found.loop[(edge.edge + 1) % found.loop.length], transform);
+
+        context.beginPath();
+        context.moveTo(ax, ay);
+        context.lineTo(bx, by);
+        context.lineCap = "round";
+        context.strokeStyle = color;
+        context.lineWidth = width;
+        context.stroke();
+        context.lineCap = "butt";
+      };
+
+      highlight(hoveredEdge, primary, 4);
+      highlight(selectedEdge, primary, 5);
+    }
 
     // --- ortho guide ---
     // A snap the user cannot see reads as the tool moving their point for no
@@ -373,9 +567,16 @@ export function MeshCanvas({
   }, [
     boundary,
     holes,
+    loops,
     draft,
     cursor,
     mesh,
+    solution,
+    showField,
+    fieldStale,
+    edgePickEnabled,
+    selectedEdge,
+    hoveredEdge,
     minAngleDeg,
     showMesh,
     stale,
@@ -431,6 +632,16 @@ export function MeshCanvas({
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
 
+    // Edge picking is checked first and returns early, so a click made while
+    // assigning boundary conditions can never fall through and place a geometry
+    // point instead. The two modes are exclusive by construction rather than by
+    // the caller remembering to disable one.
+    if (edgePickEnabled) {
+      const picked = pickEdge([x, y], loops, transformRef.current);
+      if (picked) onEdgePick(picked);
+      return;
+    }
+
     // Closing the loop is checked against the raw pointer position and takes
     // priority: snapping must not be able to pull a click off the first vertex
     // and quietly add a duplicate point instead of finishing the loop.
@@ -446,16 +657,45 @@ export function MeshCanvas({
   };
 
   const handleMove = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (edgePickEnabled) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const picked = pickEdge(
+        [event.clientX - rect.left, event.clientY - rect.top],
+        loops,
+        transformRef.current,
+      );
+
+      // Only set when the hovered edge actually changes. The handler fires at
+      // pointer rate, and re-rendering on every event would undo the point of
+      // caching the field.
+      setHoveredEdge((previous) =>
+        previous?.key === picked?.key && previous?.edge === picked?.edge
+          ? previous
+          : picked,
+      );
+
+      // No rubber band while picking, so the cursor position is not tracked.
+      return;
+    }
+
     onCursorMove(resolve(event));
   };
+
+  const hovering = edgePickEnabled && hoveredEdge !== null;
 
   return (
     <canvas
       ref={canvasRef}
       onClick={handleClick}
       onMouseMove={handleMove}
-      onMouseLeave={() => onCursorMove(null)}
-      className="block h-full w-full cursor-crosshair"
+      onMouseLeave={() => {
+        if (edgePickEnabled) {
+          setHoveredEdge(null);
+          return;
+        }
+        onCursorMove(null);
+      }}
+      className={`block h-full w-full ${hovering ? "cursor-pointer" : "cursor-crosshair"}`}
     />
   );
 }

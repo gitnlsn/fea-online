@@ -112,6 +112,68 @@ export function snapPoint(
 }
 
 /**
+ * Distance from `p` to the segment `a`-`b`, with the projection clamped to the
+ * segment rather than extended along its line.
+ *
+ * Clamping is what makes this a hit test rather than a line test: without it a
+ * click far off the end of a short edge, but level with it, would register as a
+ * hit on that edge.
+ */
+export function pointSegmentDistance(
+  p: [number, number],
+  a: [number, number],
+  b: [number, number],
+): number {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const lengthSquared = dx * dx + dy * dy;
+
+  const t =
+    lengthSquared > 0
+      ? Math.min(
+          1,
+          Math.max(0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lengthSquared),
+        )
+      : 0;
+
+  return Math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy));
+}
+
+/**
+ * The loop edge nearest a click, or null when none is close enough.
+ *
+ * Hit-tested in screen space, like the ortho lock and the loop-closing snap:
+ * the grab band is a statement about how precisely a hand can hold a mouse, so
+ * it must not shrink or grow with the geometry. Ties go to the earlier loop and
+ * the earlier edge, so a click on a shared corner always picks the same one.
+ */
+export function pickEdge<K extends string>(
+  screen: [number, number],
+  loops: { key: K; loop: Point[] }[],
+  t: Transform,
+  tolerancePx: number = ORTHO_PX,
+): { key: K; edge: number } | null {
+  let best: { key: K; edge: number } | null = null;
+  let bestDistance = tolerancePx;
+
+  for (const { key, loop } of loops) {
+    for (let edge = 0; edge < loop.length; edge++) {
+      // The closing edge is implicit in a loop, so the last one wraps.
+      const a = toScreen(loop[edge], t);
+      const b = toScreen(loop[(edge + 1) % loop.length], t);
+      const distance = pointSegmentDistance(screen, a, b);
+
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = { key, edge };
+      }
+    }
+  }
+
+  return best;
+}
+
+/**
  * Coarsest of 10/20/50 world units that keeps at least `minPx` between labels.
  *
  * Ticks stay at every major grid line; only the numbers thin out, so a narrow

@@ -34,6 +34,36 @@
   --seq-500: #256abf;
   --seq-600: #184f95;
   --seq-700: #0d366b;
+
+  /*
+   * Solution field. A second sequential context takes the next categorical
+   * hue -- orange -- so magnitude in the field never reads as magnitude in the
+   * quality ramp above. Stepped to the blue ramp's own OKLCH lightness profile
+   * rather than picked by eye: same span (0.567), strictly monotone, so the two
+   * ramps carry the same amount of ordering information.
+   */
+  --field-100: #fbd7ca;
+  --field-200: #f2b098;
+  --field-300: #e68764;
+  --field-400: #d95923;
+  --field-500: #b44005;
+  --field-600: #8a2e00;
+  --field-700: #621e00;
+
+  /*
+   * Diverging arms, used instead of the ramp above when the field crosses zero
+   * -- where the sign is the thing to see, and a one-hue ramp hides it. The
+   * documented blue/red poles with a neutral midpoint; the cool arm is the
+   * --seq-* ramp reversed, so only the warm arm and the midpoint are new.
+   */
+  --div-warm-100: #fed4d0;
+  --div-warm-200: #f7aba4;
+  --div-warm-300: #ec7f78;
+  --div-warm-400: #e04c4a;
+  --div-warm-500: #ba3333;
+  --div-warm-600: #902123;
+  --div-warm-700: #671315;
+  --div-mid: #f0efec;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -50,6 +80,14 @@
     --border: rgba(255, 255, 255, 0.1);
 
     --series-1: #3987e5;
+
+    /*
+     * The ramps themselves do not flip. Every element of the domain carries a
+     * fill, so no step ever recedes into the surface the way a sparse heatmap
+     * cell would -- and a ramp that reversed with the theme would mean "dark is
+     * hot" in one mode and "light is hot" in the other.
+     */
+    --div-mid: #383835;
   }
 }
 
@@ -66,6 +104,7 @@
   --border: rgba(255, 255, 255, 0.1);
 
   --series-1: #3987e5;
+  --div-mid: #383835;
 }
 
 body {

@@ -1,4 +1,5 @@
 import type { Loop, MeshResponse } from "./mesh";
+import type { SolveResponse } from "./solve";
 
 /**
  * Gmsh ASCII mesh, format 2.2.
@@ -77,6 +78,61 @@ export function toVtk(mesh: MeshResponse): string {
     "LOOKUP_TABLE default",
   );
   for (const angle of mesh.min_angles_deg) lines.push(String(angle));
+
+  lines.push("");
+  return lines.join("\n");
+}
+
+/**
+ * Legacy VTK carrying the solved field, for ParaView.
+ *
+ * Written as its own dataset rather than as point data on the exported mesh,
+ * because a discontinuous Galerkin solution has no single value at a shared
+ * node -- neighbouring elements legitimately disagree there, and that
+ * disagreement is a measure of how converged the answer is. Attaching the field
+ * to the mesh's own points would force an average across elements, quietly
+ * smoothing away the one thing the method is distinctive for.
+ *
+ * So the sampled lattice goes out verbatim: every element brings its own copy
+ * of every point, duplicated along shared edges. ParaView renders that as-is,
+ * jumps included.
+ */
+export function toVtkField(field: SolveResponse): string {
+  const points = field.element_count * field.sample_stride;
+  const perElement = field.sub_triangles.length / 3;
+  const cells = field.element_count * perElement;
+
+  const lines: string[] = [
+    "# vtk DataFile Version 3.0",
+    `fea-online solution, degree ${field.degree}`,
+    "ASCII",
+    "DATASET UNSTRUCTURED_GRID",
+    `POINTS ${points} double`,
+  ];
+
+  for (let i = 0; i < points; i++) {
+    lines.push(`${field.positions[i * 2]} ${field.positions[i * 2 + 1]} 0`);
+  }
+
+  // The sub-triangle list is stored once in element-local indices, so writing it
+  // out means offsetting by each element's base.
+  lines.push("", `CELLS ${cells} ${cells * 4}`);
+  for (let element = 0; element < field.element_count; element++) {
+    const base = element * field.sample_stride;
+    for (let corner = 0; corner < field.sub_triangles.length; corner += 3) {
+      lines.push(
+        `3 ${base + field.sub_triangles[corner]} ${base + field.sub_triangles[corner + 1]} ${
+          base + field.sub_triangles[corner + 2]
+        }`,
+      );
+    }
+  }
+
+  lines.push("", `CELL_TYPES ${cells}`);
+  for (let i = 0; i < cells; i++) lines.push("5");
+
+  lines.push("", `POINT_DATA ${points}`, "SCALARS u double 1", "LOOKUP_TABLE default");
+  for (const value of field.values) lines.push(String(value));
 
   lines.push("");
   return lines.join("\n");
