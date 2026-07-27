@@ -1,14 +1,20 @@
 # FEA Online
 
-Browser-based finite element tool. Draw geometry, mesh it, and (later) solve on
-it — all client-side, with the mesher compiled to WebAssembly.
+Browser-based finite element tool. Draw geometry, mesh it, and solve on it — all
+client-side, with the mesher and the solver compiled to WebAssembly.
 
 Phase 1 is the mesher: draw a boundary and holes, refine to a quality target,
 and iterate on the result interactively.
 
-Phase 2 is the solver, and has started. `crates/fea-dg` is a discontinuous
-Galerkin solver for a generic conservation equation on triangles. It is not yet
-wired to the UI.
+Phase 2 is the solver, and is wired to the UI. `crates/fea-dg` is a
+discontinuous Galerkin solver for a generic conservation equation on triangles;
+what it implements today is **steady scalar diffusion**, so the tool solves
+`-∇·(k∇u) = s` on the drawn domain. Attach a fixed value, a fixed flux or a
+convective condition to each loop — or to an individual edge, by clicking it —
+press Solve, and the field is drawn on the canvas against a legend.
+
+Transient and vector problems are solver work, not UI work: see
+[Solver](#solver) for what the trait does and does not cover yet.
 
 ## Layout
 
@@ -16,8 +22,8 @@ wired to the UI.
 fea-online/
 ├── apps/web/              Next.js UI — canvas, controls, worker
 ├── crates/
-│   ├── fea-dg/            discontinuous Galerkin solver over the mesh
-│   ├── fea-wasm/          wasm-bindgen surface over the mesher
+│   ├── fea-dg/            submodule → gitnlsn/fea-dg, the DG solver
+│   ├── fea-wasm/          wasm-bindgen surface over the mesher and the solver
 │   └── nlsn-delaunay/     submodule → gitnlsn/nlsn-delaunay-refine
 └── scripts/build-wasm.sh  builds the mesher to wasm
 ```
@@ -110,3 +116,36 @@ re-entrant corner correctly caps both at 2/3 and 4/3 for every degree.
 
 Run `cargo test --release -p fea-dg -- --nocapture` to print the convergence
 tables.
+
+### How it reaches the browser
+
+`crates/fea-wasm` exports `solve(request)` beside `mesh(request)`, and the web
+app drives it from its own worker so a solve cannot block a remesh. The request
+carries the mesh arrays the UI already holds — rather than re-meshing inside the
+solver, which could put the field on a mesh the user is not looking at — plus
+the drawn edges and a condition per edge.
+
+Three things in that path are worth knowing about:
+
+- **Boundary conditions are matched geometrically.** Neither `FlatMesh` nor the
+  wasm mesh response carries markers, so `crates/fea-wasm/src/classify.rs`
+  assigns each boundary face the tag of the input segment it lies on. This is
+  exact rather than approximate: refinement only ever *splits* an input segment,
+  at that segment's own midpoint, so a face sits on its own segment to within
+  round-off and some ten orders of magnitude closer than to any other.
+- **The field is sampled, not interpolated.** The solver's output is Dubiner
+  modal coefficients, and a discontinuous field has no single value at a shared
+  node — averaging to get one would smooth away the jumps the method exists to
+  represent. `sample.rs` evaluates each element on its own barycentric lattice
+  and emits its own copy of every point, which is also what makes a `p > 1`
+  basis visible instead of being flattened to one colour per element.
+- **Everything that could trip an assertion is rejected first.** A panic inside
+  wasm aborts the instance and takes the worker with it, so a bad number would
+  leave the UI permanently unable to solve rather than showing a message. The
+  checks in `solve.rs` mirror the solver's own `assert!`s one for one.
+
+Two results the solver reports that the picture cannot show, and which the UI
+therefore states in words: an iteration that hit its cap still returns its best
+iterate, and a problem with no prescribed value anywhere is fixed only up to a
+constant — and, if its fluxes do not balance its source, has no solution at all
+while still returning a plausible-looking one.
