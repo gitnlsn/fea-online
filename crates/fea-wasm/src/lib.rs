@@ -71,6 +71,11 @@ mod alloc_budget {
 
     /// Bytes currently accounted as live. Used by tests that need to prove a
     /// repeated operation returns memory rather than accumulating it.
+    ///
+    /// Kept even while no test calls it: it is the only way to observe the
+    /// allocator's accounting, and a leak test is exactly the kind of thing that
+    /// gets written the day something leaks.
+    #[allow(dead_code)]
     pub fn live_bytes() -> usize {
         IN_USE.load(Ordering::Relaxed)
     }
