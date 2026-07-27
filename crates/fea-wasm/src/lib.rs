@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
+mod classify;
+mod sample;
+mod solve;
+
+pub use solve::{solve_problem, ConditionSpec, SolveRequest, SolveResponse, SourceSpec};
+
 /// Hard memory ceiling for the test binary.
 ///
 /// A runaway mesher is the failure mode this crate is most likely to hit, and
@@ -371,6 +377,17 @@ pub fn mesh(request: JsValue) -> Result<JsValue, JsValue> {
         .map_err(|error| JsValue::from_str(&format!("could not serialise mesh: {}", error)))
 }
 
+#[wasm_bindgen]
+pub fn solve(request: JsValue) -> Result<JsValue, JsValue> {
+    let request: SolveRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|error| JsValue::from_str(&format!("invalid solve request: {}", error)))?;
+
+    let response = solve_problem(request).map_err(|error| JsValue::from_str(&error))?;
+
+    serde_wasm_bindgen::to_value(&response)
+        .map_err(|error| JsValue::from_str(&format!("could not serialise solution: {}", error)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +688,42 @@ mod memory_bounds {
             response.triangle_count <= 2_000,
             "cap exceeded: {} elements",
             response.triangle_count
+        );
+    }
+}
+
+/// The mesher and the solver agree on what a mesh is.
+///
+/// `fea-dg` names the mesher as a git dependency so it can build outside this
+/// repository. If the workspace `[patch]` ever stopped applying, cargo would
+/// happily build *two* copies of `nlsn-delaunay` and this file would fail to
+/// compile -- `FlatMesh` from one copy is not `FlatMesh` from the other. That
+/// is a confusing failure to meet for the first time halfway through a feature,
+/// so it is met here instead, in the smallest test that can meet it.
+#[cfg(test)]
+mod solver_seam {
+    use super::*;
+    use fea_dg::mesh::dg_mesh::DgMesh;
+
+    #[test]
+    fn a_meshed_square_can_be_solved_on() {
+        let response = build_mesh(MeshRequest {
+            boundary: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            holes: vec![],
+            min_angle_deg: 25.0,
+            max_area: Some(0.02),
+            max_steps: None,
+            max_triangles: None,
+        })
+        .unwrap();
+
+        let mesh = DgMesh::from_arrays(&response.vertices, &response.triangles)
+            .expect("the mesher produced a mesh the solver rejects");
+
+        assert_eq!(mesh.n_elements(), response.triangle_count);
+        assert!(
+            !mesh.boundary_faces().is_empty(),
+            "a bounded domain must have boundary faces"
         );
     }
 }
