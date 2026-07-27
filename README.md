@@ -11,7 +11,9 @@ discontinuous Galerkin solver for a generic conservation equation on triangles;
 what it implements today is **steady scalar diffusion**, so the tool solves
 `-∇·(k∇u) = s` on the drawn domain. Attach a fixed value, a fixed flux or a
 convective condition to each loop — or to an individual edge, by clicking it —
-press Solve, and the field is drawn on the canvas against a legend.
+press Solve, and the field is drawn on the canvas against a legend. The viewport
+switches between the plan and a 3D surface, where the field is the height over
+the mesh you drew — see [Reading the field](#reading-the-field).
 
 Transient and vector problems are solver work, not UI work: see
 [Solver](#solver) for what the trait does and does not cover yet.
@@ -149,3 +151,33 @@ therefore states in words: an iteration that hit its cap still returns its best
 iterate, and a problem with no prescribed value anywhere is fixed only up to a
 constant — and, if its fluxes do not balance its source, has no solution at all
 while still returning a plausible-looking one.
+
+### Reading the field
+
+The field is drawn two ways, and the 2D/3D switch in the corner of the viewport
+picks between them. In plan it is a colour map over the mesh; in 3D it is a
+surface, with the drawing on the ground plane and the field as height.
+
+The surface is the better picture of a DG solution, because a colour ramp can
+say *where* the field is high but not *by how much*, and it hides the
+inter-element jumps: a discontinuity that reads as two adjacent shades of orange
+in plan is a visible step in a surface. Watching those steps close as the degree
+rises is the clearest picture of convergence the tool gives.
+
+- **Raw WebGL2, no dependency.** A field at a few thousand elements is tens of
+  thousands of sub-triangles and orbiting repaints all of them per frame, which
+  is well past what filling canvas paths can do. But the sampled field is
+  already a triangle soup and the shading is one cross product of screen-space
+  derivatives, so the renderer is a shader pair (`components/SurfaceCanvas.tsx`)
+  over three small modules: `lib/mat4.ts`, `lib/orbit.ts`, `lib/surface.ts`.
+- **The buffer is non-indexed, for the same reason the sampler duplicates
+  points.** Welding the shared edges, or averaging at shared nodes, would smooth
+  away exactly what the surface exists to show.
+- **One set of ramp stops.** `lib/fieldRamp.ts` is shared by the 2D fill, the
+  legend and the shader rather than transcribed into GLSL, and the shader steps
+  it with the same arithmetic, so all three land on the same colour for the same
+  value.
+- **The vertical axis is not to scale and is not labelled.** Height is fitted to
+  the plan rather than to the field's own units, so a plate held at 100 and the
+  same plate at conductivity 1000 both open readable. The legend has the
+  numbers; the surface has the shape.
