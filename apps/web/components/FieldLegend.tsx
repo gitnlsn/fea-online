@@ -1,5 +1,6 @@
 "use client";
 
+import { Stat } from "./controls";
 import { fieldScale, rampStops, scaleMidpoint } from "../lib/fieldRamp";
 import type { SolveResponse } from "../lib/solve";
 
@@ -126,17 +127,6 @@ export function FieldLegend({ solution, stale, elapsedMs }: FieldLegendProps) {
           condition. The field near them is not what was asked for.
         </p>
       )}
-    </div>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-[11px]" style={{ color: "var(--text-muted)" }}>
-        {label}
-      </dt>
-      <dd className="tabular text-sm font-medium">{value}</dd>
     </div>
   );
 }
