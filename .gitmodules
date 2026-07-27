@@ -2,3 +2,7 @@
 	path = crates/nlsn-delaunay
 	url = git@github.com:gitnlsn/nlsn-delaunay-refine.git
 	branch = harden-mesher
+[submodule "crates/fea-dg"]
+	path = crates/fea-dg
+	url = https://github.com/gitnlsn/fea-dg.git
+	branch = main

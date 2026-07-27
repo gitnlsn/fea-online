@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/fea-wasm", "crates/nlsn-delaunay"]
+members = ["crates/fea-dg", "crates/fea-wasm", "crates/nlsn-delaunay"]
+
+# `fea-dg` is its own repository, so it declares the mesher as a git dependency
+# in order to build standalone. Inside this workspace that must resolve to the
+# submodule checkout instead: the submodule is the version this repo pins and
+# tests against, and without the patch a local mesher change would be invisible
+# to the solver until it was pushed.
+[patch."https://github.com/gitnlsn/nlsn-delaunay-refine"]
+nlsn-delaunay = { path = "crates/nlsn-delaunay" }
 
 [profile.release]
 opt-level = 3
