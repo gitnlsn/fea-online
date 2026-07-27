@@ -20,8 +20,15 @@ export const FIELD_RAMP: readonly string[] = [
   "#621e00",
 ];
 
-/** Cool arm of the diverging ramp, running away from the midpoint. */
-const DIVERGING_COOL: readonly string[] = [
+/**
+ * Cool arm of the diverging ramp, running away from the midpoint.
+ *
+ * Exported for the 3D view, which cannot call `fieldColor` -- it steps the ramp
+ * per fragment on the GPU and so needs the stops themselves, uploaded once as a
+ * uniform. Sharing the array rather than transcribing it into GLSL is what keeps
+ * the two views, and the legend, from drifting apart.
+ */
+export const DIVERGING_COOL: readonly string[] = [
   "#9ec5f4",
   "#6da7ec",
   "#3987e5",
@@ -30,8 +37,8 @@ const DIVERGING_COOL: readonly string[] = [
   "#0d366b",
 ];
 
-/** Warm arm of the diverging ramp, running away from the midpoint. */
-const DIVERGING_WARM: readonly string[] = [
+/** Warm arm of the diverging ramp, running away from the midpoint. See above. */
+export const DIVERGING_WARM: readonly string[] = [
   "#f7aba4",
   "#ec7f78",
   "#e04c4a",
@@ -138,4 +145,22 @@ export function rampStops(scale: FieldScale, neutral: string): string[] {
     return [...DIVERGING_COOL].reverse().concat(neutral, ...DIVERGING_WARM);
   }
   return [...FIELD_RAMP];
+}
+
+/**
+ * A `#rrggbb` colour as three floats in 0..1, which is the only form a GLSL
+ * uniform will take.
+ *
+ * Shorthand `#rgb` is not accepted: every colour this is asked to convert comes
+ * either from the ramps above or from a `--token` in `globals.css`, and all of
+ * those are written in full. Silently mis-parsing the one that was not is worse
+ * than returning black.
+ */
+export function rgbTriplet(hex: string): [number, number, number] {
+  const value = Number.parseInt(hex.trim().replace(/^#/, ""), 16);
+  if (!Number.isFinite(value) || hex.trim().replace(/^#/, "").length !== 6) {
+    return [0, 0, 0];
+  }
+
+  return [((value >> 16) & 255) / 255, ((value >> 8) & 255) / 255, (value & 255) / 255];
 }

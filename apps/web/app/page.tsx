@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AngleHistogram } from "../components/AngleHistogram";
 import { FieldLegend } from "../components/FieldLegend";
 import { MeshCanvas, type EdgeRef } from "../components/MeshCanvas";
+import { SurfaceCanvas } from "../components/SurfaceCanvas";
 import { meshRequestKey, useMesher } from "../hooks/useMesher";
 import { useSolver } from "../hooks/useSolver";
+import { autoZScale } from "../lib/surface";
 import { WORLD_SIZE } from "../lib/viewport";
 import {
   download,
@@ -33,6 +35,9 @@ import {
 } from "../lib/solve";
 
 type Mode = "idle" | "boundary" | "hole";
+
+/** Which projection the viewport is showing. */
+type View = "2d" | "3d";
 
 /**
  * Convex outer boundary with a rectangular hole.
@@ -84,6 +89,16 @@ export default function Page() {
   const [sourceValue, setSourceValue] = useState(0);
   const [degree, setDegree] = useState(1);
   const [showField, setShowField] = useState(true);
+
+  const [view, setView] = useState<View>("2d");
+  /**
+   * Vertical exaggeration, as a multiple of the automatic height.
+   *
+   * A multiple rather than an absolute scale, because the automatic height
+   * already absorbs the field's units -- so this control means the same thing
+   * whether the field runs to 100 or to 1e-6, and 1 is always a sensible view.
+   */
+  const [exaggeration, setExaggeration] = useState(1);
 
   const { status, mesh, error, elapsedMs, meshKey, run, clear } = useMesher();
   const {
@@ -240,6 +255,45 @@ export default function Page() {
   const canSolve =
     solveRequest !== null && !meshIsStale && solveStatus !== "solving" && !geometryError;
 
+  /** World units of height per unit of field, as the 3D view draws it. */
+  const zScale = useMemo(
+    () =>
+      solution
+        ? autoZScale(solution.min_value, solution.max_value) * exaggeration
+        : 1,
+    [solution, exaggeration],
+  );
+
+  /**
+   * The view actually being shown.
+   *
+   * Derived rather than kept in sync, for the same reason `conditions` is:
+   * without a field there is no third dimension to show, and a `view` of "3d"
+   * can outlive the solution that justified it -- clear the boundary and the
+   * stored choice still says 3D. Resolving on read means the two cannot disagree
+   * for even one render, and the switch needs no effect to walk it back.
+   */
+  const activeView: View = solution ? view : "2d";
+
+  /**
+   * Switching to 3D leaves every mode that interprets a click.
+   *
+   * Drawing and edge-picking are plan-view operations -- there is no sensible
+   * meaning for "place a point" on an orbiting surface -- and in 3D a drag has
+   * already been claimed by the camera. Leaving the modes on switch is what
+   * keeps a click from meaning two things at once, the same invariant the canvas
+   * enforces between drawing and edge-picking.
+   */
+  const showView = useCallback((next: View) => {
+    setView(next);
+    if (next === "3d") {
+      setMode("idle");
+      setDraft([]);
+      setEditingConditions(false);
+      setSelectedEdge(null);
+    }
+  }, []);
+
   const handleSolve = useCallback(() => {
     if (!solveRequest || !meshKey) return;
     runSolve(solveRequest, meshKey);
@@ -368,30 +422,69 @@ export default function Page() {
       <div className="flex min-h-0 flex-1">
         <main className="min-w-0 flex-1 p-3">
           <div
-            className="h-full w-full overflow-hidden rounded-lg border"
+            className="relative h-full w-full overflow-hidden rounded-lg border"
             style={{ background: "var(--surface)", borderColor: "var(--border)" }}
           >
-            <MeshCanvas
-              boundary={boundary}
-              holes={holes}
-              draft={draft}
-              cursor={cursor}
-              mesh={mesh}
-              solution={solution}
-              showField={showField}
-              fieldStale={solutionIsStale}
-              // Drawing and condition-editing are mutually exclusive: a click
-              // has to mean exactly one thing.
-              edgePickEnabled={editingConditions && mode === "idle"}
-              selectedEdge={selectedEdge}
-              onEdgePick={handleEdgePick}
-              minAngleDeg={minAngleDeg}
-              showMesh={showMesh}
-              stale={meshIsStale}
-              selectedRange={selectedBucket}
-              onCanvasClick={handleCanvasClick}
-              onCursorMove={setCursor}
-            />
+            {/* `activeView` is already "2d" whenever there is no solution, so
+                the null check here only tells the compiler what the derivation
+                guarantees. */}
+            {activeView === "3d" && solution ? (
+              <SurfaceCanvas
+                solution={solution}
+                mesh={mesh}
+                boundary={boundary}
+                holes={holes}
+                showMesh={showMesh}
+                zScale={zScale}
+                stale={solutionIsStale}
+              />
+            ) : (
+              <MeshCanvas
+                boundary={boundary}
+                holes={holes}
+                draft={draft}
+                cursor={cursor}
+                mesh={mesh}
+                solution={solution}
+                showField={showField}
+                fieldStale={solutionIsStale}
+                // Drawing and condition-editing are mutually exclusive: a click
+                // has to mean exactly one thing.
+                edgePickEnabled={editingConditions && mode === "idle"}
+                selectedEdge={selectedEdge}
+                onEdgePick={handleEdgePick}
+                minAngleDeg={minAngleDeg}
+                showMesh={showMesh}
+                stale={meshIsStale}
+                selectedRange={selectedBucket}
+                onCanvasClick={handleCanvasClick}
+                onCursorMove={setCursor}
+              />
+            )}
+
+            {/* Absolutely positioned so the canvas keeps the whole box: both
+                views size themselves from the parent's client area. */}
+            <div className="absolute top-2 right-2 flex gap-px">
+              <ViewTab label="2D" active={activeView === "2d"} onClick={() => showView("2d")} />
+              <ViewTab
+                label="3D"
+                active={activeView === "3d"}
+                // Nothing solved means nothing to raise: the button says so
+                // rather than switching to an empty box.
+                disabled={!solution}
+                title={solution ? undefined : "Solve first — 3D shows the field as height"}
+                onClick={() => showView("3d")}
+              />
+            </div>
+
+            {activeView === "3d" && (
+              <p
+                className="absolute bottom-2 left-2 text-[11px]"
+                style={{ color: "var(--text-muted)" }}
+              >
+                Drag to orbit · scroll to zoom · double-click to reset
+              </p>
+            )}
           </div>
         </main>
 
@@ -802,7 +895,7 @@ export default function Page() {
                     : "Solve"}
               </button>
 
-              {solution && (
+              {solution && activeView === "2d" && (
                 <label className="flex items-center gap-2 text-xs">
                   <input
                     type="checkbox"
@@ -811,6 +904,34 @@ export default function Page() {
                     className="accent-[var(--series-1)]"
                   />
                   <span style={{ color: "var(--text-secondary)" }}>Show field</span>
+                </label>
+              )}
+
+              {/* In 3D the field *is* the surface, so there is nothing to hide;
+                  what the reader needs instead is control over how tall it is. */}
+              {solution && activeView === "3d" && (
+                <label className="block">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                      Vertical exaggeration
+                    </span>
+                    <span className="tabular text-xs font-medium">
+                      {exaggeration.toFixed(1)}×
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={4}
+                    step={0.1}
+                    value={exaggeration}
+                    onChange={(event) => setExaggeration(Number(event.target.value))}
+                    className="mt-1 w-full accent-[var(--series-1)]"
+                  />
+                  <p className="mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                    Height is scaled to fit the plan, so the vertical axis is not
+                    to scale and carries no units. The legend has the numbers.
+                  </p>
                 </label>
               )}
 
@@ -942,6 +1063,39 @@ export default function Page() {
         </aside>
       </div>
     </div>
+  );
+}
+
+/** One side of the viewport's projection switch. */
+function ViewTab({
+  label,
+  active,
+  disabled,
+  title,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  disabled?: boolean;
+  title?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-pressed={active}
+      className="rounded border px-2 py-1 text-[11px] font-medium transition-colors disabled:opacity-40"
+      style={{
+        background: active ? "var(--series-1)" : "var(--surface)",
+        borderColor: active ? "var(--series-1)" : "var(--border)",
+        color: active ? "var(--surface)" : "var(--text-muted)",
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

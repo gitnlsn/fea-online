@@ -9,6 +9,10 @@
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
+    // `lib/` is imported two ways: by the bundler, which does not care, and by
+    // `node --test --experimental-strip-types`, which requires the extension to
+    // be written out. Allowing it is what lets the same file satisfy both.
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
