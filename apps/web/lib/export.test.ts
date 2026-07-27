@@ -6,6 +6,7 @@ import {
   toGeometryJson,
   toGmsh,
   toVtk,
+  toVtkField,
 } from "./export.ts";
 import {
   loopCornerAngles,
@@ -15,6 +16,7 @@ import {
   validateLoop,
 } from "./mesh.ts";
 import type { MeshResponse } from "./mesh.ts";
+import type { SolveResponse } from "./solve.ts";
 
 /** A unit square as two triangles sharing the diagonal 0-2. */
 function unitSquareMesh(): MeshResponse {
@@ -27,6 +29,7 @@ function unitSquareMesh(): MeshResponse {
     min_angle_deg: 45,
     angle_histogram: [],
     terminated_early: false,
+    unimprovable_elements: 0,
     outcome: "converged",
     provable_termination: true,
   };
@@ -236,5 +239,57 @@ describe("mesh request identity", () => {
 
   it("distinguishes an absent area bound from a present one", () => {
     assert.notEqual(meshRequestKey(base), meshRequestKey({ ...base, max_area: null }));
+  });
+});
+
+/** Two elements, each sampled on the n=1 lattice: 3 points, 1 sub-triangle. */
+function twoElementField(): SolveResponse {
+  return {
+    positions: [0, 0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 1],
+    values: [1, 2, 3, 4, 5, 6],
+    sub_triangles: [0, 1, 2],
+    sample_stride: 3,
+    subdivisions: 1,
+    element_count: 2,
+    mode_count: 3,
+    degree: 1,
+    min_value: 1,
+    max_value: 6,
+    iterations: 10,
+    residual_norm: 1e-12,
+    initial_norm: 1,
+    converged: true,
+    singular: false,
+    unclassified_faces: 0,
+    worst_match_distance: 0,
+  };
+}
+
+describe("solution VTK export", () => {
+  const lines = toVtkField(twoElementField()).split("\n");
+
+  it("writes one point per element per lattice point, not per mesh node", () => {
+    // The duplication along shared edges is the point: a discontinuous field
+    // has no single value at a shared node, and averaging to get one would
+    // smooth away the jumps the method exists to represent.
+    assert.equal(lines[lines.indexOf("POINTS 6 double")], "POINTS 6 double");
+    assert.equal(lines[lines.indexOf("POINT_DATA 6")], "POINT_DATA 6");
+  });
+
+  it("offsets the shared sub-triangle list into each element's own points", () => {
+    const start = lines.indexOf("CELLS 2 8");
+    assert.notEqual(start, -1, "cell count and size header");
+    assert.equal(lines[start + 1], "3 0 1 2");
+    assert.equal(lines[start + 2], "3 3 4 5", "the second element must not reuse element 0's points");
+  });
+
+  it("carries every sampled value as point data", () => {
+    const start = lines.indexOf("LOOKUP_TABLE default");
+    assert.deepEqual(lines.slice(start + 1, start + 7), ["1", "2", "3", "4", "5", "6"]);
+  });
+
+  it("declares one triangle cell type per sub-triangle", () => {
+    const start = lines.indexOf("CELL_TYPES 2");
+    assert.deepEqual(lines.slice(start + 1, start + 3), ["5", "5"]);
   });
 });

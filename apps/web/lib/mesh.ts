@@ -9,6 +9,11 @@ export interface MeshRequest {
   min_angle_deg: number;
   max_area?: number | null;
   max_steps?: number | null;
+  /**
+   * Element ceiling. Primarily a memory bound; omitting it takes the mesher's
+   * own `RefineParams::DEFAULT_MAX_TRIANGLES`.
+   */
+  max_triangles?: number | null;
 }
 
 export interface MeshResponse {
@@ -28,7 +33,21 @@ export interface MeshResponse {
    * does not meet the requested quality everywhere.
    */
   terminated_early: boolean;
-  outcome: "converged" | "hit_step_limit" | "hit_vertex_limit";
+  /**
+   * How many elements refinement ran out of moves on.
+   *
+   * Zero unless the outcome is `left_unimprovable`. Distinct from the count of
+   * elements below the target angle, which is a property of the finished mesh:
+   * this is the number that says the target is unreachable rather than merely
+   * unmet.
+   */
+  unimprovable_elements: number;
+  /** Mirrors `outcome_label` in `crates/fea-wasm/src/lib.rs`. */
+  outcome:
+    | "converged"
+    | "hit_step_limit"
+    | "hit_size_limit"
+    | "left_unimprovable";
   /**
    * Whether the quality target sits inside Ruppert's provable-termination
    * regime (roughly, a minimum angle at or below 20.7 degrees).
