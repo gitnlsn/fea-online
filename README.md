@@ -7,16 +7,18 @@ Phase 1 is the mesher: draw a boundary and holes, refine to a quality target,
 and iterate on the result interactively.
 
 Phase 2 is the solver, and is wired to the UI. `crates/fea-dg` is a
-discontinuous Galerkin solver for a generic conservation equation on triangles;
-what it implements today is **steady scalar diffusion**, so the tool solves
+discontinuous Galerkin solver for a generic conservation equation on triangles,
+and it implements two of them. **Steady scalar diffusion** solves
 `-∇·(k∇u) = s` on the drawn domain. Attach a fixed value, a fixed flux or a
 convective condition to each loop — or to an individual edge, by clicking it —
 press Solve, and the field is drawn on the canvas against a legend. The viewport
 switches between the plan and a 3D surface, where the field is the height over
 the mesh you drew — see [Reading the field](#reading-the-field).
 
-Transient and vector problems are solver work, not UI work: see
-[Solver](#solver) for what the trait does and does not cover yet.
+**Transient compressible Euler** solves for air: set a blast off inside the
+domain and watch the shock expand, reflect off the walls you drew and diffract
+around the holes, then scrub or play back through it. See
+[Shock waves](#shock-waves).
 
 ## Layout
 
@@ -92,9 +94,19 @@ known-good version rather than whatever is currently checked out.
 ```
 
 where the caller supplies `J`. Choosing it recovers the equation: `J = -k∇u` is
-diffusion, and its steady state is Poisson. The transient hyperbolic path
-(`J = a·u`, explicit time stepping) and solid stress–strain are not implemented
-yet; the trait is shaped so they are additions rather than a rewrite.
+diffusion, whose steady state is Poisson; `J = a·u` is linear advection; and the
+compressible Euler flux over `(ρ, ρu, ρv, E)` is the same trait at `N = 4`.
+Solid stress–strain is not implemented yet; the trait is shaped so it is an
+addition rather than a rewrite.
+
+An equation states its flux in two halves — advective and diffusive — because
+the face term needs them separately. A diffusive flux is taken wholly from one
+side, the LDG alternating choice; an advective one is upwinded, because
+information along a characteristic travels one way and averaging it is
+unconditionally unstable. Boundaries follow the same split: the elliptic
+conditions are the `αu + β(J·n) = g` relation, and the hyperbolic ones are
+**ghost states** — a slip wall is the interior with its normal velocity
+reversed, which no choice of `α` and `β` can express.
 
 The discretisation is LDG — the auxiliary variable `q = ∇u` is recovered by the
 same weak form as `u`, so advective and diffusive fluxes share one code path —
@@ -151,6 +163,85 @@ therefore states in words: an iteration that hit its cap still returns its best
 iterate, and a problem with no prescribed value anywhere is fixed only up to a
 constant — and, if its fluxes do not balance its source, has no solution at all
 while still returning a plausible-looking one.
+
+### Shock waves
+
+Pick **Air** at the top of the sidebar and the app solves compressible Euler on
+the drawn domain instead of diffusion. The two studies do not share a panel
+between them: in Air there is no conductivity on screen, because there is no
+conductivity in the problem.
+
+Choose a blast, a shock tube or still air; say what is outside each boundary —
+per loop, or per edge by clicking the drawing, exactly as the diffusion study's
+conditions are assigned; press Run, and scrub or play the result.
+
+Four boundary conditions, and the solver picks the regime rather than the user:
+
+| | |
+|---|---|
+| **Wall** | reflects; the ghost is the interior with its normal velocity reversed |
+| **Open** | extrapolates everything. Exact only above Mach 1 |
+| **Inflow** | a state, imposed in full when supersonic and less its pressure when not |
+| **Outflow** | a back pressure, non-reflecting when subsonic and transparent when not |
+
+`Inflow` and `Outflow` decide per face, from the flow itself, how many of the
+four characteristics are entering and therefore how many components may be
+imposed. A user who had to choose correctly between "supersonic inflow" and
+"subsonic inflow" would be being asked for the answer before the run.
+
+The gain from `Outflow` over `Open` is measured, not asserted: an acoustic pulse
+leaving a subsonic boundary leaves **2.8× less** behind it
+(`a_subsonic_outflow_reflects_less_than_a_transmissive_one`). It also anchors the
+pressure level, which plain extrapolation cannot — with nothing prescribed there
+is nothing to hold it.
+
+**Velocity is drawn as arrows, not as a colour.** It is a vector, and a colour
+map has nowhere to put a direction, so colouring by `|v|` alone throws away most
+of what the field says. The arrows sit over whichever scalar is coloured —
+density, pressure, total or internal energy, speed or Mach number — and are
+thinned to a roughly fixed count on screen rather than in the data, since how
+many fit is a property of the zoom and not of the mesh.
+
+Each boundary edge is stroked by what is assigned to it, colour **and** dash. The
+stylesheet defines one categorical hue and reserves the status colours for things
+"only ever shown alongside an explicit count + label", so meaning that rested on
+hue alone would be both unavailable and against the grain of the file.
+
+Four choices are worth knowing about.
+
+- **The state is conserved variables, never primitive ones.** A conservation
+  law's weak form is only a conservation law in `(ρ, ρu, ρv, E)`; integrating
+  the primitive form across a shock gives the wrong jump conditions, so a scheme
+  written in pressure and velocity converges smoothly and confidently to a shock
+  moving at the **wrong speed**. `tests/euler_sod.rs` is the only test that can
+  catch that, which is why it compares against an exact Riemann solution rather
+  than measuring a rate.
+- **Limiting is not optional.** At a strong pressure ratio an unlimited
+  high-order reconstruction reaches negative pressure, the sound speed becomes
+  the square root of a negative number, and the whole field is `NaN` within a
+  few steps. Two passes run after every Runge-Kutta stage: a slope limiter
+  against the neighbouring cell averages, and a Zhang-Shu pass that keeps
+  density and pressure positive at every point a flux is evaluated. That the
+  second is load-bearing is asserted, not assumed —
+  `the_same_blast_without_positivity_limiting_does_not_survive`.
+- **A higher degree does not pay off across a shock.** The slope limiter scales
+  every mode above the constant by one factor, so an element it touches is
+  reduced to a straight line whatever its degree — and across a shock it touches
+  most of them. Measured on a fixed shock tube, `p = 2` is half again *worse*
+  than `p = 1` for nearly twice the work. A hierarchical limiter, which limits
+  mode by mode, would fix it and is not implemented.
+- **The run is pulled a frame at a time.** A steady solve is one call; a
+  transient run is thousands of steps producing sixty fields. Returning them in
+  one call would mean no progress, no cancellation, and every frame held in Rust
+  and in JavaScript at once. So the worker holds a `TransientRun` and asks it for
+  frames, positions cross once because they never change, and the bulk payload
+  is a real `Float32Array` rather than the boxed `Array` that
+  `serde_wasm_bindgen` would produce.
+
+The colour range spans the **whole run**, not each frame. A per-frame range
+would rescale the ramp on every tick, so a decaying blast would read as a field
+of constant intensity moving through a changing colour scheme — the opposite of
+what the animation is for.
 
 ### Reading the field
 
