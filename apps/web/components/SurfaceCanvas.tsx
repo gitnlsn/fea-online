@@ -9,7 +9,7 @@ import {
   rgbTriplet,
 } from "../lib/fieldRamp";
 import type { Loop, MeshResponse } from "../lib/mesh";
-import type { SolveResponse } from "../lib/solve";
+import type { DrawableField } from "../lib/solve";
 import { DEFAULT_CAMERA, dolly, orbit, viewProjection, type Camera } from "../lib/orbit";
 import {
   buildElementOutlines,
@@ -164,7 +164,7 @@ type BufferName = "surface" | "outlines" | "wireframe" | "plan" | "grid";
 const BUFFER_NAMES: BufferName[] = ["surface", "outlines", "wireframe", "plan", "grid"];
 
 interface SurfaceCanvasProps {
-  solution: SolveResponse;
+  solution: DrawableField;
   mesh: MeshResponse | null;
   boundary: Loop | null;
   holes: Loop[];

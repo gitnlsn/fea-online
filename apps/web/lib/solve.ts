@@ -73,23 +73,58 @@ export interface SolveRequest {
   subdivisions: number;
 }
 
-export interface SolveResponse {
+/**
+ * Everything the two viewports need in order to draw a field, and nothing else.
+ *
+ * Split out from `SolveResponse` because a transient frame is drawable but is
+ * not a solve: it has no iteration count, no residual, and nothing to say about
+ * whether a linear system converged. Both renderers take this, so a frame of an
+ * animation and the answer to a steady solve go down exactly the same path --
+ * which is the only way the two views are guaranteed to agree about what a
+ * field looks like.
+ *
+ * The arrays are `ArrayLike` rather than `number[]` because a transient frame
+ * arrives from Rust as a `Float32Array`, transferred rather than copied.
+ */
+export interface DrawableField {
   /** Interleaved [x, y] per sample point, element-major. */
-  positions: number[];
+  positions: ArrayLike<number>;
   /** The field at each sample point. */
-  values: number[];
+  values: ArrayLike<number>;
   /** Sub-triangle corners as local lattice indices, shared by every element. */
-  sub_triangles: number[];
+  sub_triangles: ArrayLike<number>;
   /** Sample points per element. */
   sample_stride: number;
   subdivisions: number;
-
   element_count: number;
-  mode_count: number;
-  degree: number;
 
   min_value: number;
   max_value: number;
+
+  /**
+   * Distinguishes one field from another when nothing else about it does.
+   *
+   * The plan view rasterises the field into an offscreen canvas and reuses it
+   * until something changes, and decides what "changes" means from the field's
+   * dimensions and colour range. For a steady solve that is enough. For a frame
+   * of an animation it is not: every frame of a run has the same element count,
+   * the same lattice and -- deliberately, so the ramp does not rescale under the
+   * viewer -- the same colour range. Without something that varies, the cache
+   * would serve frame zero for the whole run.
+   *
+   * Absent on a steady solution, where the existing key already separates one
+   * solve from the next.
+   */
+  identity?: string | number;
+}
+
+export interface SolveResponse extends DrawableField {
+  positions: number[];
+  values: number[];
+  sub_triangles: number[];
+
+  mode_count: number;
+  degree: number;
 
   iterations: number;
   residual_norm: number;

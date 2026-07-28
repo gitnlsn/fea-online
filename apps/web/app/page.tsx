@@ -10,8 +10,15 @@ import { GeometryPanel, type Mode } from "../components/panels/GeometryPanel";
 import { MeshPanel } from "../components/panels/MeshPanel";
 import { PhysicsPanel } from "../components/panels/PhysicsPanel";
 import { SolvePanel } from "../components/panels/SolvePanel";
+import { GasPanel } from "../components/panels/GasPanel";
+import { GasBoundaryPanel } from "../components/panels/GasBoundaryPanel";
+import { RunPanel } from "../components/panels/RunPanel";
+import { StudySwitch, type Study } from "../components/StudySwitch";
+import { TimeSlider } from "../components/TimeSlider";
 import { meshRequestKey, useMesher } from "../hooks/useMesher";
 import { useSolver } from "../hooks/useSolver";
+import { usePlayback } from "../hooks/usePlayback";
+import { useTransient } from "../hooks/useTransient";
 import { autoZScale } from "../lib/surface";
 import { WORLD_SIZE } from "../lib/viewport";
 import { loopCornerAngles, validateLoop, type Loop, type Point } from "../lib/mesh";
@@ -26,8 +33,22 @@ import {
   type BoundaryConditions,
   type ConditionValue,
   type EdgeKey,
+  type DrawableField,
   type LoopKey,
 } from "../lib/solve";
+import {
+  blastInitial,
+  buildTransientGeometry,
+  frameField,
+  gasConditionFor,
+  GAS_CONDITION_TONES,
+  NO_GAS_CONDITIONS,
+  reconcileGasConditions,
+  transientRequestKey,
+  type GasConditions,
+  type GasConditionValue,
+  type TransientSettings,
+} from "../lib/transient";
 
 /** Which projection the viewport is showing. */
 type View = "2d" | "3d";
@@ -73,7 +94,32 @@ const DEFAULT_PANELS: Record<string, boolean> = {
   mesh: true,
   physics: false,
   solve: true,
+  gas: true,
+  boundaries: true,
+  run: true,
   export: false,
+};
+
+/**
+ * A blast in the middle of the world box, at ten times ambient.
+ *
+ * Ten is chosen to be visibly a shock while staying comfortably inside what the
+ * scheme handles without the positivity limiter having to work hard, so the
+ * default run looks right rather than being a stress test.
+ */
+const DEFAULT_TRANSIENT: TransientSettings = {
+  initial: blastInitial([WORLD_SIZE / 2, WORLD_SIZE / 2], WORLD_SIZE / 10, 10),
+  // Long enough for the wave to cross the sample domain, reflect off the walls
+  // and pile up in the corners. A shorter run finishes sooner and shows only the
+  // blast expanding, which is the least interesting part and not what the panel
+  // says it does.
+  endTime: 30,
+  frames: 60,
+  degree: 1,
+  cfl: 0.3,
+  limiter: 0,
+  field: "density",
+  showVectors: true,
 };
 
 export default function Page() {
@@ -92,7 +138,14 @@ export default function Page() {
   // never directly: this can still name a loop that has since been redrawn.
   const [storedConditions, setConditions] = useState<BoundaryConditions>(NO_CONDITIONS);
   const [storedSelectedEdge, setSelectedEdge] = useState<EdgeRef | null>(null);
-  const [editingConditions, setEditingConditions] = useState(false);
+  /**
+   * Which study's boundary conditions are being picked, if either.
+   *
+   * A discriminant rather than two booleans, because `MeshCanvas` takes exactly
+   * one `selectedEdge`/`onEdgePick` pair and a click has to mean exactly one
+   * thing. Two flags could both be true; this cannot.
+   */
+  const [editing, setEditing] = useState<null | "steady" | "gas">(null);
   const [conductivity, setConductivity] = useState(1);
   const [sourceValue, setSourceValue] = useState(0);
   const [degree, setDegree] = useState(1);
@@ -108,6 +161,10 @@ export default function Page() {
    */
   const [exaggeration, setExaggeration] = useState(1);
 
+  const [study, setStudy] = useState<Study>("steady");
+  const [transient, setTransient] = useState<TransientSettings>(DEFAULT_TRANSIENT);
+  const [storedGasConditions, setGasConditions] = useState<GasConditions>(NO_GAS_CONDITIONS);
+
   const [openPanels, setOpenPanels] = useState(DEFAULT_PANELS);
 
   const { status, mesh, error, elapsedMs, meshKey, run, clear } = useMesher();
@@ -120,6 +177,22 @@ export default function Page() {
     run: runSolve,
     clear: clearSolution,
   } = useSolver();
+  const {
+    status: transientStatus,
+    setup: transientSetup,
+    positions: transientPositions,
+    vectorOrigins: transientVectorOrigins,
+    frames: transientFrames,
+    progress: transientProgress,
+    error: transientError,
+    elapsedMs: transientElapsedMs,
+    runKey: transientKey,
+    range: transientRange,
+    run: runTransient,
+    cancel: cancelTransient,
+    clear: clearTransient,
+  } = useTransient();
+  const playback = usePlayback(transientFrames.length);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const togglePanel = useCallback((id: string) => {
@@ -289,13 +362,93 @@ export default function Page() {
     if (!boundary) clearSolution();
   }, [boundary, clearSolution]);
 
+  /**
+   * Gas conditions as they apply to the geometry currently drawn.
+   *
+   * Same reconcile-on-read discipline as `conditions`: editors write to the
+   * stored value, everything that reads a condition reads this, so the two
+   * cannot disagree for even one render.
+   */
+  const gasConditions = useMemo(
+    () => reconcileGasConditions(boundary, holes, storedGasConditions),
+    [boundary, holes, storedGasConditions],
+  );
+
+  /** The transient problem as currently stated, or null when there is none. */
+  const transientRequest = useMemo(() => {
+    if (!mesh || !boundary || geometryError) return null;
+
+    return {
+      vertices: mesh.vertices,
+      triangles: mesh.triangles,
+      ...buildTransientGeometry(boundary, holes, gasConditions),
+      initial: transient.initial,
+      gamma: 1.4,
+      degree: transient.degree,
+      end_time: transient.endTime,
+      frames: transient.frames,
+      cfl: transient.cfl,
+      limiter: transient.limiter,
+      // Held below the steady path's, because the cost is paid once per frame
+      // rather than once per solve and nobody reads curvature off a moving
+      // surface.
+      subdivisions: Math.min(2, subdivisionsFor(transient.degree)),
+      field: transient.field,
+    };
+  }, [mesh, boundary, holes, geometryError, transient, gasConditions]);
+
+  const transientIsStale = useMemo(() => {
+    if (!transientKey || !transientRequest || !meshKey) return false;
+    return transientKey !== transientRequestKey(transientRequest, meshKey);
+  }, [transientKey, transientRequest, meshKey]);
+
+  useEffect(() => {
+    if (!boundary) clearTransient();
+  }, [boundary, clearTransient]);
+
+  const canRunTransient =
+    transientRequest !== null &&
+    !meshIsStale &&
+    transientStatus !== "running" &&
+    !geometryError;
+
+  const handleRunTransient = useCallback(() => {
+    if (!transientRequest || !meshKey) return;
+    setStudy("transient");
+    playback.seek(0);
+    runTransient(transientRequest, meshKey);
+  }, [transientRequest, meshKey, runTransient, playback]);
+
+  /**
+   * The frame currently on screen, presented as something drawable.
+   *
+   * Both viewports take a `DrawableField`, so a transient frame and a steady
+   * solution go down exactly the same path -- which is what guarantees the two
+   * studies are drawn by the same code and cannot disagree about what a field
+   * looks like.
+   */
+  const transientFrame = useMemo(() => {
+    if (!transientSetup || !transientPositions || transientFrames.length === 0) return null;
+    const frame = transientFrames[Math.min(playback.frame, transientFrames.length - 1)];
+    return frameField(transientSetup, transientPositions, frame, transientRange);
+  }, [transientSetup, transientPositions, transientFrames, playback.frame, transientRange]);
+
+  /** What the viewport draws, whichever study is showing. */
+  const shownField: DrawableField | null =
+    study === "transient" ? transientFrame : solution;
+  const shownIsStale = study === "transient" ? transientIsStale : solutionIsStale;
+  const shownTime =
+    study === "transient" && transientFrames.length > 0
+      ? transientFrames[Math.min(playback.frame, transientFrames.length - 1)].time
+      : 0;
+
   const canSolve =
     solveRequest !== null && !meshIsStale && solveStatus !== "solving" && !geometryError;
 
   /** World units of height per unit of field, as the 3D view draws it. */
   const zScale = useMemo(
-    () => (solution ? autoZScale(solution.min_value, solution.max_value) * exaggeration : 1),
-    [solution, exaggeration],
+    () => (shownField ? autoZScale(shownField.min_value, shownField.max_value) * exaggeration : 1),
+    [shownField, exaggeration],
   );
 
   /**
@@ -307,7 +460,7 @@ export default function Page() {
    * stored choice still says 3D. Resolving on read means the two cannot disagree
    * for even one render, and the switch needs no effect to walk it back.
    */
-  const activeView: View = solution ? view : "2d";
+  const activeView: View = shownField ? view : "2d";
 
   /**
    * Switching to 3D leaves every mode that interprets a click.
@@ -323,13 +476,17 @@ export default function Page() {
     if (next === "3d") {
       setMode("idle");
       setDraft([]);
-      setEditingConditions(false);
+      setEditing(null);
       setSelectedEdge(null);
     }
   }, []);
 
   const handleSolve = useCallback(() => {
     if (!solveRequest || !meshKey) return;
+    // Pressing Solve is a statement about what you want to look at, not only
+    // about what you want computed: leaving an animation on screen while the
+    // steady field arrives behind it would be the surprising thing.
+    setStudy("steady");
     runSolve(solveRequest, meshKey);
   }, [solveRequest, meshKey, runSolve]);
 
@@ -361,27 +518,104 @@ export default function Page() {
     [],
   );
 
+  const setGasLoopCondition = useCallback((key: LoopKey, next: GasConditionValue) => {
+    setGasConditions((previous) => ({
+      ...previous,
+      loops: { ...previous.loops, [key]: next },
+    }));
+  }, []);
+
+  const setGasEdgeCondition = useCallback((key: EdgeKey, next: GasConditionValue) => {
+    setGasConditions((previous) => ({
+      ...previous,
+      edges: { ...previous.edges, [key]: next },
+    }));
+  }, []);
+
+  const clearGasEdgeCondition = useCallback(
+    (key: EdgeKey, loop: LoopKey, edge: number) => {
+      setGasConditions((previous) => {
+        const edges = { ...previous.edges };
+        delete edges[key];
+        return { ...previous, edges };
+      });
+      setSelectedEdge((previous) =>
+        previous?.key === loop && previous.edge === edge ? null : previous,
+      );
+    },
+    [],
+  );
+
   /**
    * Clicking an edge splits it out of its loop's group.
    *
    * The override is seeded from whatever the edge already resolves to, so
    * selecting an edge never changes the problem -- only what can be edited.
    */
-  const handleEdgePick = useCallback((picked: EdgeRef) => {
-    setSelectedEdge(picked);
-    const key = `${picked.key}:${picked.edge}` as EdgeKey;
-    setConditions((previous) =>
-      previous.edges[key]
-        ? previous
-        : {
-            ...previous,
-            edges: {
-              ...previous.edges,
-              [key]: { ...conditionFor(previous, picked.key, picked.edge) },
+  const handleEdgePick = useCallback(
+    (picked: EdgeRef) => {
+      setSelectedEdge(picked);
+      const key = `${picked.key}:${picked.edge}` as EdgeKey;
+
+      // The click belongs to whichever study asked for it, and exactly one can
+      // have done so.
+      if (editing === "gas") {
+        setGasConditions((previous) =>
+          previous.edges[key]
+            ? previous
+            : {
+                ...previous,
+                edges: {
+                  ...previous.edges,
+                  [key]: { ...gasConditionFor(previous, picked.key, picked.edge) },
+                },
+              },
+        );
+        return;
+      }
+
+      setConditions((previous) =>
+        previous.edges[key]
+          ? previous
+          : {
+              ...previous,
+              edges: {
+                ...previous.edges,
+                [key]: { ...conditionFor(previous, picked.key, picked.edge) },
+              },
             },
-          },
-    );
-  }, []);
+      );
+    },
+    [editing],
+  );
+
+  /**
+   * How each boundary edge is stroked while the gas study is showing.
+   *
+   * Read from the CSS custom properties at draw time, since a canvas cannot use
+   * them directly. Only supplied in the Air study — in Diffusion the drawing
+   * keeps its uniform outline.
+   */
+  const gasEdgeTone = useCallback(
+    (loop: LoopKey, edge: number) => {
+      const tone = GAS_CONDITION_TONES[gasConditionFor(gasConditions, loop, edge).kind];
+      const styles = getComputedStyle(document.documentElement);
+      return {
+        color: styles.getPropertyValue(tone.token).trim() || "#888",
+        dash: tone.dash,
+        width: tone.width,
+      };
+    },
+    [gasConditions],
+  );
+
+  /** The velocity field of the frame on screen, when arrows are asked for. */
+  const shownVectors = useMemo(() => {
+    if (study !== "transient" || !transient.showVectors) return null;
+    if (!transientVectorOrigins || transientFrames.length === 0) return null;
+    const frame = transientFrames[Math.min(playback.frame, transientFrames.length - 1)];
+    return { origins: transientVectorOrigins, values: frame.vectors, fastest: frame.fastest };
+  }, [study, transient.showVectors, transientVectorOrigins, transientFrames, playback.frame]);
 
   const handleCanvasClick = useCallback(
     (point: Point, snappedToStart: boolean) => {
@@ -459,15 +693,17 @@ export default function Page() {
             {/* `activeView` is already "2d" whenever there is no solution, so
                 the null check here only tells the compiler what the derivation
                 guarantees. */}
-            {activeView === "3d" && solution ? (
+            {activeView === "3d" && shownField ? (
               <SurfaceCanvas
-                solution={solution}
+                solution={shownField}
                 mesh={mesh}
                 boundary={boundary}
                 holes={holes}
-                showMesh={showMesh}
+                // Element outlines on a moving surface are noise, and drawing
+                // them doubles the per-frame buffer work for it.
+                showMesh={showMesh && !playback.playing}
                 zScale={zScale}
-                stale={solutionIsStale}
+                stale={shownIsStale}
               />
             ) : (
               <MeshCanvas
@@ -476,12 +712,14 @@ export default function Page() {
                 draft={draft}
                 cursor={cursor}
                 mesh={mesh}
-                solution={solution}
+                solution={shownField}
+                edgeTone={study === "transient" ? gasEdgeTone : undefined}
+                vectors={shownVectors}
                 showField={showField}
-                fieldStale={solutionIsStale}
+                fieldStale={shownIsStale}
                 // Drawing and condition-editing are mutually exclusive: a click
                 // has to mean exactly one thing.
-                edgePickEnabled={editingConditions && mode === "idle"}
+                edgePickEnabled={editing !== null && mode === "idle"}
                 selectedEdge={selectedEdge}
                 onEdgePick={handleEdgePick}
                 minAngleDeg={minAngleDeg}
@@ -502,13 +740,23 @@ export default function Page() {
                 active={activeView === "3d"}
                 // Nothing solved means nothing to raise: the button says so
                 // rather than switching to an empty box.
-                disabled={!solution}
-                title={solution ? undefined : "Solve first — 3D shows the field as height"}
+                disabled={!shownField}
+                title={shownField ? undefined : "Solve first — 3D shows the field as height"}
                 onClick={() => showView("3d")}
               />
             </div>
 
-            {activeView === "3d" && (
+            {study === "transient" && transientFrames.length > 0 && (
+              <TimeSlider
+                playback={playback}
+                frames={transientFrames.length}
+                total={transient.frames}
+                time={shownTime}
+                endTime={transient.endTime}
+              />
+            )}
+
+            {activeView === "3d" && study !== "transient" && (
               <p
                 className="absolute bottom-2 left-2 text-[11px]"
                 style={{ color: "var(--text-muted)" }}
@@ -523,6 +771,17 @@ export default function Page() {
           className="w-80 shrink-0 space-y-4 overflow-y-auto border-l p-4"
           style={{ borderColor: "var(--border)" }}
         >
+          <StudySwitch
+            study={study}
+            onChange={(next) => {
+              setStudy(next);
+              // Editing belongs to a study, so it does not survive leaving one:
+              // a pick made in Air must not land in Poisson's conditions.
+              setEditing(null);
+              setSelectedEdge(null);
+            }}
+          />
+
           {/* Pinned above the panels, and outside them. A warning that can be
               collapsed out of sight is a warning that will be missed. */}
           {geometryError && (
@@ -611,7 +870,7 @@ export default function Page() {
             />
           </Panel>
 
-          {boundary && (
+          {study === "steady" && boundary && (
             <Panel
               id="physics"
               title="Physics"
@@ -623,9 +882,9 @@ export default function Page() {
                 boundary={boundary}
                 holes={holes}
                 conditions={conditions}
-                editingConditions={editingConditions}
+                editingConditions={editing === "steady"}
                 onToggleEditing={() => {
-                  setEditingConditions((previous) => !previous);
+                  setEditing((previous) => (previous === "steady" ? null : "steady"));
                   setSelectedEdge(null);
                 }}
                 selectedEdge={selectedEdge}
@@ -642,7 +901,7 @@ export default function Page() {
             </Panel>
           )}
 
-          {boundary && (
+          {study === "steady" && boundary && (
             <Panel
               id="solve"
               title="Solve"
@@ -680,6 +939,85 @@ export default function Page() {
                 onExaggerationChange={setExaggeration}
               />
             </Panel>
+          )}
+
+          {study === "transient" && (
+            <>
+              <Panel
+                id="gas"
+                title="Gas"
+                summary={
+                  transient.initial.kind === "blast"
+                    ? `blast ×${transient.initial.inside.pressure}`
+                    : transient.initial.kind === "riemann"
+                      ? "shock tube"
+                      : "still air"
+                }
+                open={openPanels.gas}
+                onToggle={togglePanel}
+              >
+                <GasPanel settings={transient} onChange={setTransient} world={WORLD_SIZE} />
+              </Panel>
+
+              {boundary && (
+                <Panel
+                  id="boundaries"
+                  title="Boundaries"
+                  summary={
+                    Object.keys(gasConditions.edges).length > 0
+                      ? `${Object.keys(gasConditions.edges).length} edge overrides`
+                      : undefined
+                  }
+                  open={openPanels.boundaries}
+                  onToggle={togglePanel}
+                >
+                  <GasBoundaryPanel
+                    boundary={boundary}
+                    holes={holes}
+                    conditions={gasConditions}
+                    editing={editing === "gas"}
+                    onToggleEditing={() => {
+                      setEditing((previous) => (previous === "gas" ? null : "gas"));
+                      setSelectedEdge(null);
+                      setMode("idle");
+                      setDraft([]);
+                    }}
+                    selectedEdge={selectedEdge}
+                    onLoopCondition={setGasLoopCondition}
+                    onEdgeCondition={setGasEdgeCondition}
+                    onClearEdgeCondition={clearGasEdgeCondition}
+                  />
+                </Panel>
+              )}
+
+              <Panel
+                id="run"
+                title="Run"
+                summary={
+                  transientStatus === "running"
+                    ? `frame ${transientFrames.length}/${transient.frames}`
+                    : transientFrames.length > 0 && transientIsStale
+                      ? "out of date"
+                      : undefined
+                }
+                open={openPanels.run}
+                onToggle={togglePanel}
+              >
+                <RunPanel
+                  settings={transient}
+                  onChange={setTransient}
+                  status={transientStatus}
+                  progress={transientProgress}
+                  frameCount={transientFrames.length}
+                  elapsedMs={transientElapsedMs}
+                  error={transientError}
+                  stale={transientIsStale}
+                  canRun={canRunTransient}
+                  onRun={handleRunTransient}
+                  onCancel={cancelTransient}
+                />
+              </Panel>
+            </>
           )}
 
           <Panel id="export" title="Export" open={openPanels.export} onToggle={togglePanel}>

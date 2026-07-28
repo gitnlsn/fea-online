@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Loop, MeshResponse, Point } from "../lib/mesh";
 import { fieldColor, fieldScale } from "../lib/fieldRamp";
-import type { LoopKey, SolveResponse } from "../lib/solve";
+import type { DrawableField, LoopKey } from "../lib/solve";
 import {
   computeTransform,
   labelStep,
@@ -45,7 +45,7 @@ const TICK_PX = 4;
  */
 function paintField(
   context: CanvasRenderingContext2D,
-  solution: SolveResponse,
+  solution: DrawableField,
   t: Transform,
   neutral: string,
 ) {
@@ -124,7 +124,7 @@ interface MeshCanvasProps {
    * fills in the same pixels answer different questions and neither survives
    * being read through the other.
    */
-  solution: SolveResponse | null;
+  solution: DrawableField | null;
   showField: boolean;
   /**
    * The field belongs to a problem that has since changed -- different
@@ -132,6 +132,27 @@ interface MeshCanvasProps {
    * mesh is.
    */
   fieldStale: boolean;
+  /**
+   * How each boundary edge should be stroked, when a study wants the drawing to
+   * say what is assigned to it.
+   *
+   * A function rather than a conditions object, so this component stays free of
+   * both condition models -- it knows how to stroke an edge, not what a Robin
+   * coefficient or a back pressure is. Omitted, every loop strokes uniformly and
+   * the single-path route below is taken, so the steady view is unchanged.
+   */
+  edgeTone?: (loop: LoopKey, edge: number) => { color: string; dash: number[]; width: number } | null;
+
+  /**
+   * A vector field to draw over the scalar, as `[vx, vy]` anchored at
+   * `vectorOrigins`.
+   *
+   * Its own channel, not a component of `solution`. Velocity has a direction,
+   * and a colour map has nowhere to put one -- so colouring by `|v|` alone
+   * discards most of what the field says. Arrows carry both.
+   */
+  vectors?: { origins: ArrayLike<number>; values: ArrayLike<number>; fastest: number } | null;
+
   /** Clicking an edge selects it, rather than placing a geometry point. */
   edgePickEnabled: boolean;
   selectedEdge: EdgeRef | null;
@@ -161,6 +182,8 @@ export function MeshCanvas({
   cursor,
   mesh,
   solution,
+  edgeTone,
+  vectors,
   showField,
   fieldStale,
   edgePickEnabled,
@@ -353,6 +376,7 @@ export function MeshCanvas({
         solution.max_value,
         solution.element_count,
         solution.subdivisions,
+        solution.identity ?? null,
         transform,
         neutral,
         ratio,
@@ -475,8 +499,93 @@ export function MeshCanvas({
       context.stroke();
     };
 
-    if (boundary) strokeLoop(boundary, series, 2);
-    holes.forEach((hole) => strokeLoop(hole, series, 2));
+    // With a tone function, every edge is stroked on its own so it can carry its
+    // own colour and dash; without one, each loop is a single path as before.
+    const strokeLoopByEdge = (key: LoopKey, loop: Loop) => {
+      if (loop.length < 2) return;
+      for (let edge = 0; edge < loop.length; edge++) {
+        const tone = edgeTone?.(key, edge) ?? null;
+        const [ax, ay] = toScreen(loop[edge], transform);
+        const [bx, by] = toScreen(loop[(edge + 1) % loop.length], transform);
+
+        context.beginPath();
+        context.moveTo(ax, ay);
+        context.lineTo(bx, by);
+        context.strokeStyle = tone?.color ?? series;
+        context.lineWidth = tone?.width ?? 2;
+        context.setLineDash(tone?.dash ?? []);
+        context.stroke();
+      }
+      context.setLineDash([]);
+    };
+
+    if (edgeTone) {
+      if (boundary) strokeLoopByEdge("boundary", boundary);
+      holes.forEach((hole, index) => strokeLoopByEdge(`hole:${index}` as LoopKey, hole));
+    } else {
+      if (boundary) strokeLoop(boundary, series, 2);
+      holes.forEach((hole) => strokeLoop(hole, series, 2));
+    }
+
+    // --- velocity arrows ---
+    // Over the field rather than under it: the scalar is the background and the
+    // motion is the annotation. Thinned on screen rather than in the data,
+    // because how many arrows fit is a property of the zoom, not of the mesh.
+    if (vectors && vectors.fastest > 0) {
+      const count = Math.floor(vectors.values.length / 2);
+      // One arrow per element is far too many when zoomed out. Keep roughly a
+      // fixed number on screen whatever the mesh.
+      const wanted = 260;
+      const stride = Math.max(1, Math.ceil(count / wanted));
+      // Longest arrow spans about this much of the viewport, so the fastest gas
+      // reads clearly without the picture becoming a thicket.
+      const longest = Math.min(cssWidth, cssHeight) * 0.045;
+      const scale = longest / vectors.fastest;
+
+      context.strokeStyle = primary;
+      context.fillStyle = primary;
+      context.lineWidth = 1;
+      context.globalAlpha = (fieldStale || stale ? 0.2 : 1) * 0.75;
+
+      for (let index = 0; index < count; index += stride) {
+        const vx = vectors.values[index * 2];
+        const vy = vectors.values[index * 2 + 1];
+        const speed = Math.hypot(vx, vy);
+        // Below a pixel there is no direction to show, only noise.
+        if (!(speed * scale > 1.5)) continue;
+
+        const [ox, oy] = toScreen(
+          [vectors.origins[index * 2], vectors.origins[index * 2 + 1]],
+          transform,
+        );
+        // Screen y runs down while world y runs up, so the arrow's y flips.
+        const tipX = ox + vx * scale;
+        const tipY = oy - vy * scale;
+
+        context.beginPath();
+        context.moveTo(ox, oy);
+        context.lineTo(tipX, tipY);
+        context.stroke();
+
+        // A head, so a stationary-looking short arrow still shows which way.
+        const angle = Math.atan2(oy - tipY, tipX - ox);
+        const head = Math.min(5, speed * scale * 0.4);
+        context.beginPath();
+        context.moveTo(tipX, tipY);
+        context.lineTo(
+          tipX - head * Math.cos(angle - 0.4),
+          tipY + head * Math.sin(angle - 0.4),
+        );
+        context.lineTo(
+          tipX - head * Math.cos(angle + 0.4),
+          tipY + head * Math.sin(angle + 0.4),
+        );
+        context.closePath();
+        context.fill();
+      }
+
+      context.globalAlpha = 1;
+    }
 
     // --- picked edges ---
     // Drawn over the outlines rather than instead of them, so an edge under the
@@ -572,6 +681,8 @@ export function MeshCanvas({
     cursor,
     mesh,
     solution,
+    edgeTone,
+    vectors,
     showField,
     fieldStale,
     edgePickEnabled,

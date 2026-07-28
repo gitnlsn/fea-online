@@ -9,7 +9,7 @@
  */
 
 import type { MeshResponse, Loop } from "./mesh.ts";
-import type { SolveResponse } from "./solve.ts";
+import type { DrawableField } from "./solve.ts";
 import { MAJOR_STEP, WORLD_SIZE } from "./viewport.ts";
 
 /**
@@ -41,7 +41,7 @@ export function latticeIndex(i: number, j: number, n: number): number {
  * exists to show. See `crates/fea-wasm/src/sample.rs` for the same argument at
  * the source.
  */
-export function buildSurface(solution: SolveResponse): Float32Array {
+export function buildSurface(solution: DrawableField): Float32Array {
   const { positions, values, sub_triangles, sample_stride, element_count } = solution;
   const out = new Float32Array(element_count * sub_triangles.length * 3);
 
@@ -70,7 +70,7 @@ export function buildSurface(solution: SolveResponse): Float32Array {
  * into a mesh of noise; the element outline is the thing that corresponds to
  * "the mesh" as the 2D view uses the word, and it is where the DG jumps live.
  */
-export function buildElementOutlines(solution: SolveResponse): Float32Array {
+export function buildElementOutlines(solution: DrawableField): Float32Array {
   const { positions, values, sample_stride, element_count, subdivisions } = solution;
   const n = Math.max(1, subdivisions);
 
