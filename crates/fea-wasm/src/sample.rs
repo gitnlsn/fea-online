@@ -45,6 +45,121 @@ pub struct Sampled {
     pub max: f64,
 }
 
+/// The reference basis evaluated once on a lattice, reusable for every element
+/// and every frame.
+///
+/// Split out from [`sample_field`] because a transient run samples the same
+/// lattice at every frame. Rebuilding the table per frame would be a few
+/// thousand basis evaluations thrown away each time, and the whole point of the
+/// frame-at-a-time protocol is that per-frame work stays proportional to the
+/// field rather than to the setup.
+pub struct LatticeBasis {
+    /// `[point][mode]`, flattened.
+    basis: Vec<f64>,
+    points: Vec<[f64; 2]>,
+    n_modes: usize,
+}
+
+impl LatticeBasis {
+    pub fn new(degree: usize, subdivisions: usize) -> Self {
+        let points = lattice_points(subdivisions.max(1));
+        let dubiner = Dubiner::new(degree);
+        let n_modes = dubiner.len();
+
+        let mut basis = vec![0.0; points.len() * n_modes];
+        for (point, &[r, s]) in points.iter().enumerate() {
+            dubiner.evaluate(r, s, &mut basis[point * n_modes..(point + 1) * n_modes]);
+        }
+
+        LatticeBasis {
+            basis,
+            points,
+            n_modes,
+        }
+    }
+
+    /// Sample points per element.
+    pub fn stride(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn points(&self) -> &[[f64; 2]] {
+        &self.points
+    }
+
+    fn at(&self, point: usize) -> &[f64] {
+        &self.basis[point * self.n_modes..(point + 1) * self.n_modes]
+    }
+}
+
+/// The sample positions alone, which never change once the mesh is fixed.
+///
+/// Emitted once per run rather than once per frame. At a few thousand elements
+/// the positions are the larger half of a frame's payload, and they are the half
+/// that is identical every time.
+pub fn sample_positions(mesh: &DgMesh, lattice: &LatticeBasis) -> Vec<f32> {
+    let mut positions = Vec::with_capacity(mesh.n_elements() * lattice.stride() * 2);
+    for element in 0..mesh.n_elements() {
+        for &reference in lattice.points() {
+            let [x, y] = mesh.map_to_physical(element, reference);
+            positions.push(x as f32);
+            positions.push(y as f32);
+        }
+    }
+    positions
+}
+
+/// Evaluates a scalar derived from an `N`-variable solution into a caller-owned
+/// buffer, and returns its extremes.
+///
+/// Takes the buffer rather than returning one so that a run of sixty frames
+/// allocates once. Returns the extremes in `f64` because they are accumulated
+/// before the narrowing to `f32`, so a legend cannot disagree with the picture
+/// by a rounding.
+///
+/// A non-finite sample is *reported*, not silently written: a `NaN` reaching the
+/// colour scale produces an all-neutral field with no error anywhere, which
+/// looks like a solver that returned nothing rather than one that diverged.
+pub fn sample_into<const N: usize, F>(
+    out: &mut [f32],
+    mesh: &DgMesh,
+    solution: &Solution<N>,
+    lattice: &LatticeBasis,
+    derive: F,
+) -> Result<(f64, f64), String>
+where
+    F: Fn(&[f64; N]) -> f64,
+{
+    let stride = lattice.stride();
+    let expected = mesh.n_elements() * stride;
+    if out.len() != expected {
+        return Err(format!(
+            "the sample buffer holds {} values, but this mesh and lattice need {expected}",
+            out.len()
+        ));
+    }
+
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    for element in 0..mesh.n_elements() {
+        for point in 0..stride {
+            let state = solution.evaluate_with(element, lattice.at(point));
+            let value = derive(&state);
+            if !value.is_finite() {
+                return Err(format!(
+                    "element {element} sampled to a non-finite value; the run has diverged"
+                ));
+            }
+            min = min.min(value);
+            max = max.max(value);
+            out[element * stride + point] = value as f32;
+        }
+    }
+
+    Ok((min, max))
+}
+
 /// Sample points per element for a lattice of order `n`.
 pub fn lattice_size(n: usize) -> usize {
     (n + 1) * (n + 2) / 2

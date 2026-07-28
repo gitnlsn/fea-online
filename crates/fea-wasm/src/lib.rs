@@ -21,6 +21,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 mod classify;
+pub mod transient;
 mod sample;
 mod solve;
 

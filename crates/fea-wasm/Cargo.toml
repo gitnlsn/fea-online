@@ -14,6 +14,10 @@ console_error_panic_hook = "0.1"
 # the workspace `[patch]` redirects that to `../nlsn-delaunay`, so both crates
 # below resolve to the same checkout and `FlatMesh` is one type, not two.
 fea-dg = { path = "../fea-dg" }
+# Only for `Float32Array`: the transient path returns a frame of a few hundred
+# thousand floats sixty times a run, and serde-wasm-bindgen would box every one
+# of them into a JavaScript `Array` rather than a typed array.
+js-sys = "0.3"
 nlsn-delaunay = { path = "../nlsn-delaunay" }
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"

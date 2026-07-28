@@ -345,6 +345,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "fea-dg",
+ "js-sys",
  "nlsn-delaunay",
  "serde",
  "serde-wasm-bindgen",
