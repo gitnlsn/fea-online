@@ -13,10 +13,12 @@ import type { DrawableField } from "../lib/solve";
 import { DEFAULT_CAMERA, dolly, orbit, viewProjection, type Camera } from "../lib/orbit";
 import {
   buildElementOutlines,
+  buildOutlineDisplacements,
   buildPlanGrid,
   buildPlanOutline,
   buildPlanWireframe,
   buildSurface,
+  buildSurfaceDisplacements,
 } from "../lib/surface";
 
 /**
@@ -37,18 +39,24 @@ import {
 
 const SURFACE_VERTEX = `#version 300 es
 in vec3 aPosition;
+// The in-plane displacement, for a study that has one. Attribute 1 is left
+// disabled otherwise, which makes WebGL supply the constant set by
+// vertexAttrib3f -- so this reads zero rather than reading nothing.
+in vec3 aWarp;
 
 uniform mat4 uMvp;
 uniform float uZScale;
+uniform float uWarp;
 
 out float vValue;
 out vec3 vWorld;
 
 void main() {
-  // z arrives as the raw field value; the exaggeration is applied here so that
-  // moving the slider is a uniform update rather than a buffer rebuild.
+  // z arrives as the raw field value and xy as the undeformed plan; both
+  // exaggerations are applied here so that moving either slider is a uniform
+  // update rather than a buffer rebuild.
   vValue = aPosition.z;
-  vWorld = vec3(aPosition.xy, aPosition.z * uZScale);
+  vWorld = vec3(aPosition.xy + uWarp * aWarp.xy, aPosition.z * uZScale);
   gl_Position = uMvp * vec4(vWorld, 1.0);
 }`;
 
@@ -123,12 +131,14 @@ void main() {
 
 const LINE_VERTEX = `#version 300 es
 in vec3 aPosition;
+in vec3 aWarp;
 
 uniform mat4 uMvp;
 uniform float uZScale;
+uniform float uWarp;
 
 void main() {
-  gl_Position = uMvp * vec4(aPosition.xy, aPosition.z * uZScale, 1.0);
+  gl_Position = uMvp * vec4(aPosition.xy + uWarp * aWarp.xy, aPosition.z * uZScale, 1.0);
 }`;
 
 const LINE_FRAGMENT = `#version 300 es
@@ -159,9 +169,24 @@ interface Resources {
   counts: Record<BufferName, number>;
 }
 
-type BufferName = "surface" | "outlines" | "wireframe" | "plan" | "grid";
+type BufferName =
+  | "surface"
+  | "outlines"
+  | "wireframe"
+  | "plan"
+  | "grid"
+  | "surfaceWarp"
+  | "outlinesWarp";
 
-const BUFFER_NAMES: BufferName[] = ["surface", "outlines", "wireframe", "plan", "grid"];
+const BUFFER_NAMES: BufferName[] = [
+  "surface",
+  "outlines",
+  "wireframe",
+  "plan",
+  "grid",
+  "surfaceWarp",
+  "outlinesWarp",
+];
 
 interface SurfaceCanvasProps {
   solution: DrawableField;
@@ -172,6 +197,16 @@ interface SurfaceCanvasProps {
   showMesh: boolean;
   /** World units of height per unit of field. See `autoZScale`. */
   zScale: number;
+  /**
+   * How far to exaggerate the field's in-plane displacement. See
+   * `autoWarpScale`.
+   *
+   * Has no effect unless the field carries displacements, which is only the
+   * solid study -- and when it does not, the attribute stays disabled and reads
+   * a constant zero, so the arithmetic is identical to what it was before this
+   * existed.
+   */
+  warp?: number;
   /** The field answers a problem that has since changed. */
   stale: boolean;
 }
@@ -183,6 +218,7 @@ export function SurfaceCanvas({
   holes,
   showMesh,
   zScale,
+  warp = 0,
   stale,
 }: SurfaceCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -244,10 +280,30 @@ export function SurfaceCanvas({
 
     gl.bindVertexArray(resources.vao);
 
-    const drawLines = (name: BufferName, color: number[]) => {
+    /**
+     * Points attribute 1 at a displacement buffer, or -- when there is none --
+     * disables it and leaves WebGL supplying a constant zero.
+     *
+     * The constant is what keeps every study but the solid bit-identical to
+     * what it drew before displacements existed: `aWarp` reads (0,0,0) and the
+     * added term vanishes exactly rather than approximately.
+     */
+    const bindWarp = (name: BufferName | null) => {
+      if (name && resources.counts[name] > 0) {
+        gl.enableVertexAttribArray(1);
+        gl.bindBuffer(gl.ARRAY_BUFFER, resources.buffers[name]);
+        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      } else {
+        gl.disableVertexAttribArray(1);
+        gl.vertexAttrib3f(1, 0, 0, 0);
+      }
+    };
+
+    const drawLines = (name: BufferName, color: number[], warpBuffer: BufferName | null) => {
       const count = resources.counts[name];
       if (count === 0) return;
 
+      bindWarp(warpBuffer);
       gl.bindBuffer(gl.ARRAY_BUFFER, resources.buffers[name]);
       gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
       gl.uniform3fv(resources.line.uniform.uColor, color);
@@ -258,17 +314,21 @@ export function SurfaceCanvas({
     gl.useProgram(resources.line.program);
     gl.uniformMatrix4fv(resources.line.uniform.uMvp, false, mvp);
     gl.uniform1f(resources.line.uniform.uZScale, zScale);
+    gl.uniform1f(resources.line.uniform.uWarp, warp);
     gl.uniform3fv(resources.line.uniform.uBackground, background);
     gl.uniform1f(resources.line.uniform.uDim, 0);
 
-    drawLines("grid", gridline);
-    if (showMesh) drawLines("wireframe", gridline);
-    drawLines("plan", baseline);
+    // The plan is what was *drawn*, so it stays undeformed even when the
+    // surface above it moves -- that contrast is the point of having both.
+    drawLines("grid", gridline, null);
+    if (showMesh) drawLines("wireframe", gridline, null);
+    drawLines("plan", baseline, null);
 
     // --- the solution, above it ---
     gl.useProgram(resources.surface.program);
     gl.uniformMatrix4fv(resources.surface.uniform.uMvp, false, mvp);
     gl.uniform1f(resources.surface.uniform.uZScale, zScale);
+    gl.uniform1f(resources.surface.uniform.uWarp, warp);
     gl.uniform3fv(resources.surface.uniform.uNeutral, neutral);
     gl.uniform3fv(resources.surface.uniform.uBackground, background);
     gl.uniform1i(resources.surface.uniform.uDiverging, scale.kind === "diverging" ? 1 : 0);
@@ -278,6 +338,7 @@ export function SurfaceCanvas({
     gl.uniform1f(resources.surface.uniform.uDim, dim);
 
     if (resources.counts.surface > 0) {
+      bindWarp("surfaceWarp");
       gl.bindBuffer(gl.ARRAY_BUFFER, resources.buffers.surface);
       gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
       // Pushes the fill back a hair in depth so the element borders drawn next
@@ -292,11 +353,11 @@ export function SurfaceCanvas({
     if (showMesh) {
       gl.useProgram(resources.line.program);
       gl.uniform1f(resources.line.uniform.uDim, dim);
-      drawLines("outlines", muted);
+      drawLines("outlines", muted, "outlinesWarp");
     }
 
     gl.bindVertexArray(null);
-  }, [solution, showMesh, zScale, stale]);
+  }, [solution, showMesh, zScale, warp, stale]);
 
   // --- one-time GL setup ---
   useEffect(() => {
@@ -315,6 +376,7 @@ export function SurfaceCanvas({
     const surface = createProgram(gl, SURFACE_VERTEX, SURFACE_FRAGMENT, [
       "uMvp",
       "uZScale",
+      "uWarp",
       "uSequential",
       "uCool",
       "uWarm",
@@ -329,6 +391,7 @@ export function SurfaceCanvas({
     const line = createProgram(gl, LINE_VERTEX, LINE_FRAGMENT, [
       "uMvp",
       "uZScale",
+      "uWarp",
       "uColor",
       "uBackground",
       "uDim",
@@ -350,6 +413,10 @@ export function SurfaceCanvas({
     // Both programs bind position to location 0, so one enabled attribute
     // serves every draw and only the bound buffer changes.
     gl.enableVertexAttribArray(0);
+    // Location 1 is the displacement, and is enabled per draw rather than here:
+    // most draws have none, and a disabled attribute reads the constant below.
+    gl.disableVertexAttribArray(1);
+    gl.vertexAttrib3f(1, 0, 0, 0);
     gl.bindVertexArray(null);
 
     const buffers = {} as Record<BufferName, WebGLBuffer>;
@@ -386,6 +453,22 @@ export function SurfaceCanvas({
     const { gl, buffers, counts } = resources;
     upload(gl, buffers.surface, buildSurface(solution), counts, "surface");
     upload(gl, buffers.outlines, buildElementOutlines(solution), counts, "outlines");
+    // Empty for a field with no displacement, which leaves the counts at zero
+    // and so leaves `bindWarp` taking the constant path.
+    upload(
+      gl,
+      buffers.surfaceWarp,
+      buildSurfaceDisplacements(solution) ?? new Float32Array(0),
+      counts,
+      "surfaceWarp",
+    );
+    upload(
+      gl,
+      buffers.outlinesWarp,
+      buildOutlineDisplacements(solution) ?? new Float32Array(0),
+      counts,
+      "outlinesWarp",
+    );
   }, [solution]);
 
   useEffect(() => {
@@ -530,9 +613,10 @@ function createProgram(
   const program = gl.createProgram();
   gl.attachShader(program, vertex);
   gl.attachShader(program, fragment);
-  // Bound before linking so both programs agree on the attribute location, which
-  // is what lets one vertex array object serve every draw.
+  // Bound before linking so both programs agree on the attribute locations,
+  // which is what lets one vertex array object serve every draw.
   gl.bindAttribLocation(program, 0, "aPosition");
+  gl.bindAttribLocation(program, 1, "aWarp");
   gl.linkProgram(program);
 
   // The shaders are linked into the program and are not needed again.

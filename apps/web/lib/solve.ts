@@ -116,6 +116,18 @@ export interface DrawableField {
    * solve from the next.
    */
   identity?: string | number;
+
+  /**
+   * The displacement at each sample point, interleaved [dx, dy] and sharing
+   * `positions`' indexing exactly.
+   *
+   * Undeformed positions plus a separate displacement, rather than deformed
+   * positions, so that the exaggeration slider is a uniform update rather than a
+   * buffer rebuild -- the same reasoning `uZScale` rests on. Absent for every
+   * study whose field is not a displacement, and a renderer that finds it absent
+   * draws the plan exactly as it always did.
+   */
+  displacements?: ArrayLike<number>;
 }
 
 export interface SolveResponse extends DrawableField {

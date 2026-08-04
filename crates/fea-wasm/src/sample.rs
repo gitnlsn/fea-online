@@ -19,6 +19,7 @@
 
 use fea_dg::mesh::dg_mesh::DgMesh;
 use fea_dg::reference::dubiner::Dubiner;
+use fea_dg::solver::gradient::{gradient_length, gradient_trace};
 use fea_dg::solver::solution::Solution;
 
 /// A field ready to draw: sub-triangles over per-element sample points.
@@ -158,6 +159,111 @@ where
     }
 
     Ok((min, max))
+}
+
+/// Evaluates a two-component field derived from the solution, interleaved.
+///
+/// Its own routine rather than two calls to [`sample_into`] so the pair is
+/// written interleaved and shares [`sample_positions`]' indexing exactly --
+/// which is what lets a renderer add a displacement to a position without a
+/// second index map.
+///
+/// Returns the largest magnitude, which is what an automatic warp scale is
+/// computed from: a bracket under a realistic load moves by microns, and drawing
+/// that to scale draws nothing.
+pub fn sample_vector_into<const N: usize, F>(
+    out: &mut [f32],
+    mesh: &DgMesh,
+    solution: &Solution<N>,
+    lattice: &LatticeBasis,
+    derive: F,
+) -> Result<f64, String>
+where
+    F: Fn(&[f64; N]) -> [f64; 2],
+{
+    let stride = lattice.stride();
+    let expected = mesh.n_elements() * stride * 2;
+    if out.len() != expected {
+        return Err(format!(
+            "the vector buffer holds {} values, but this mesh and lattice need {expected}",
+            out.len()
+        ));
+    }
+
+    let mut largest = 0.0f64;
+    for element in 0..mesh.n_elements() {
+        for point in 0..stride {
+            let state = solution.evaluate_with(element, lattice.at(point));
+            let value = derive(&state);
+            if !value[0].is_finite() || !value[1].is_finite() {
+                return Err(format!(
+                    "element {element} sampled to a non-finite vector; the run has diverged"
+                ));
+            }
+            largest = largest.max(value[0].hypot(value[1]));
+            let base = (element * stride + point) * 2;
+            out[base] = value[0] as f32;
+            out[base + 1] = value[1] as f32;
+        }
+    }
+
+    Ok(largest)
+}
+
+/// Evaluates the LDG-recovered gradient on the display lattice, as the three
+/// independent components of the symmetric part.
+///
+/// The gradient arrives as modal coefficients **in the same Dubiner basis** as
+/// the solution, so the lattice table built for one serves the other and no
+/// second basis evaluation happens anywhere. That is a property of the LDG
+/// auxiliary solve -- `q` is recovered into the discrete space, not
+/// differentiated out of it -- and it is why sampling a strain costs the same as
+/// sampling a displacement.
+///
+/// Emitted as `(eps_xx, eps_yy, eps_xy)` with the *tensor* shear rather than as
+/// the four gradient entries: the skew part is a rigid rotation and carries no
+/// stress, so sending it would be sending a component every consumer must
+/// remember to discard.
+pub fn sample_strain_into(
+    out: &mut [f32],
+    mesh: &DgMesh,
+    gradient: &[f64],
+    n_modes: usize,
+    lattice: &LatticeBasis,
+) -> Result<(), String> {
+    let stride = lattice.stride();
+    let expected = mesh.n_elements() * stride * 3;
+    if out.len() != expected {
+        return Err(format!(
+            "the strain buffer holds {} values, but this mesh and lattice need {expected}",
+            out.len()
+        ));
+    }
+    let needed = gradient_length::<2>(mesh.n_elements(), n_modes);
+    if gradient.len() != needed {
+        return Err(format!(
+            "the gradient holds {} coefficients, but this mesh and basis need {needed}",
+            gradient.len()
+        ));
+    }
+
+    for element in 0..mesh.n_elements() {
+        for point in 0..stride {
+            let q = gradient_trace::<2>(gradient, n_modes, element, lattice.at(point));
+            let strain = [q[0][0], q[1][1], 0.5 * (q[0][1] + q[1][0])];
+            if strain.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "element {element} sampled to a non-finite strain; the run has diverged"
+                ));
+            }
+            let base = (element * stride + point) * 3;
+            out[base] = strain[0] as f32;
+            out[base + 1] = strain[1] as f32;
+            out[base + 2] = strain[2] as f32;
+        }
+    }
+
+    Ok(())
 }
 
 /// Sample points per element for a lattice of order `n`.

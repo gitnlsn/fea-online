@@ -1,7 +1,7 @@
 "use client";
 
 /** Which equation the app is set up to solve. */
-export type Study = "steady" | "transient";
+export type Study = "steady" | "transient" | "elastic";
 
 /**
  * Picks the equation, and with it which half of the sidebar applies.
@@ -23,8 +23,9 @@ export function StudySwitch({
   onChange: (next: Study) => void;
 }) {
   const options: { value: Study; label: string; hint: string }[] = [
-    { value: "steady", label: "Diffusion", hint: "steady · −∇·(k∇u) = s" },
-    { value: "transient", label: "Air", hint: "transient · Euler" },
+    { value: "steady", label: "Diffusion", hint: "−∇·(k∇u) = s" },
+    { value: "elastic", label: "Solid", hint: "∇·σ + b = 0" },
+    { value: "transient", label: "Air", hint: "Euler" },
   ];
 
   return (

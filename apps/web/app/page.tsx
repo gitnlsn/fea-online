@@ -13,10 +13,18 @@ import { SolvePanel } from "../components/panels/SolvePanel";
 import { GasPanel } from "../components/panels/GasPanel";
 import { GasBoundaryPanel } from "../components/panels/GasBoundaryPanel";
 import { RunPanel } from "../components/panels/RunPanel";
+import {
+  DEFAULT_MATERIAL,
+  MaterialPanel,
+  type Material,
+} from "../components/panels/MaterialPanel";
+import { SupportPanel } from "../components/panels/SupportPanel";
+import { StressPanel } from "../components/panels/StressPanel";
 import { StudySwitch, type Study } from "../components/StudySwitch";
 import { TimeSlider } from "../components/TimeSlider";
 import { meshRequestKey, useMesher } from "../hooks/useMesher";
 import { useSolver } from "../hooks/useSolver";
+import { useElastic } from "../hooks/useElastic";
 import { usePlayback } from "../hooks/usePlayback";
 import { useTransient } from "../hooks/useTransient";
 import { autoZScale } from "../lib/surface";
@@ -36,6 +44,19 @@ import {
   type DrawableField,
   type LoopKey,
 } from "../lib/solve";
+import {
+  autoWarpScale,
+  buildElasticGeometry,
+  deriveField,
+  elasticConditionFor,
+  ELASTIC_CONDITION_TONES,
+  elasticRequestKey,
+  NO_ELASTIC_CONDITIONS,
+  reconcileElasticConditions,
+  type ElasticConditions,
+  type ElasticConditionValue,
+  type ElasticField,
+} from "../lib/elastic";
 import {
   blastInitial,
   buildTransientGeometry,
@@ -97,6 +118,9 @@ const DEFAULT_PANELS: Record<string, boolean> = {
   gas: true,
   boundaries: true,
   run: true,
+  material: false,
+  supports: true,
+  stress: true,
   export: false,
 };
 
@@ -145,7 +169,7 @@ export default function Page() {
    * one `selectedEdge`/`onEdgePick` pair and a click has to mean exactly one
    * thing. Two flags could both be true; this cannot.
    */
-  const [editing, setEditing] = useState<null | "steady" | "gas">(null);
+  const [editing, setEditing] = useState<null | "steady" | "gas" | "solid">(null);
   const [conductivity, setConductivity] = useState(1);
   const [sourceValue, setSourceValue] = useState(0);
   const [degree, setDegree] = useState(1);
@@ -165,6 +189,20 @@ export default function Page() {
   const [transient, setTransient] = useState<TransientSettings>(DEFAULT_TRANSIENT);
   const [storedGasConditions, setGasConditions] = useState<GasConditions>(NO_GAS_CONDITIONS);
 
+  const [material, setMaterial] = useState<Material>(DEFAULT_MATERIAL);
+  const [storedElasticConditions, setElasticConditions] =
+    useState<ElasticConditions>(NO_ELASTIC_CONDITIONS);
+  const [elasticField, setElasticField] = useState<ElasticField>("von_mises");
+  /**
+   * Deformation exaggeration, as a multiple of the automatic warp.
+   *
+   * A multiple rather than an absolute factor, for the reason `exaggeration` is:
+   * the automatic warp already absorbs the units, so 1 opens the shape readably
+   * whether the part moves by millimetres or by microns, and 0 is the undeformed
+   * comparison.
+   */
+  const [deformation, setDeformation] = useState(1);
+
   const [openPanels, setOpenPanels] = useState(DEFAULT_PANELS);
 
   const { status, mesh, error, elapsedMs, meshKey, run, clear } = useMesher();
@@ -177,6 +215,15 @@ export default function Page() {
     run: runSolve,
     clear: clearSolution,
   } = useSolver();
+  const {
+    status: elasticStatus,
+    solution: elasticSolution,
+    error: elasticError,
+    elapsedMs: elasticElapsedMs,
+    solutionKey: elasticSolutionKey,
+    run: runElastic,
+    clear: clearElastic,
+  } = useElastic();
   const {
     status: transientStatus,
     setup: transientSetup,
@@ -374,6 +421,60 @@ export default function Page() {
     [boundary, holes, storedGasConditions],
   );
 
+  /**
+   * Elastic conditions as they apply to the geometry currently drawn.
+   *
+   * Same reconcile-on-read discipline as the other two studies: editors write to
+   * the stored value, everything that reads a condition reads this.
+   */
+  const elasticConditions = useMemo(
+    () => reconcileElasticConditions(boundary, holes, storedElasticConditions),
+    [boundary, holes, storedElasticConditions],
+  );
+
+  /** The elastic problem as currently stated, or null when there is none. */
+  const elasticRequest = useMemo(() => {
+    if (!mesh || !boundary || geometryError) return null;
+
+    return {
+      vertices: mesh.vertices,
+      triangles: mesh.triangles,
+      ...buildElasticGeometry(boundary, holes, elasticConditions),
+      youngs_modulus: material.youngsModulus,
+      poisson_ratio: material.poissonRatio,
+      plane: material.plane,
+      body_force: material.bodyForce,
+      degree: material.degree,
+      tolerance: 1e-10,
+      // Generous where the diffusion path is not: two coupled variables and a
+      // block preconditioner that ignores the coupling means an elastic solve
+      // legitimately needs an order of magnitude more iterations.
+      max_iterations: 20_000,
+      subdivisions: subdivisionsFor(material.degree),
+    };
+  }, [mesh, boundary, holes, geometryError, elasticConditions, material]);
+
+  const elasticIsStale = useMemo(() => {
+    if (!elasticSolution || !elasticSolutionKey || !elasticRequest || !meshKey) return false;
+    return elasticSolutionKey !== elasticRequestKey(elasticRequest, meshKey);
+  }, [elasticSolution, elasticSolutionKey, elasticRequest, meshKey]);
+
+  useEffect(() => {
+    if (!boundary) clearElastic();
+  }, [boundary, clearElastic]);
+
+  /**
+   * The solved part as a drawable scalar.
+   *
+   * Derived on the main thread rather than requested from Rust, which is what
+   * makes the field dropdown instant: the response carries displacement and
+   * strain, and every scalar offered is an algebraic function of those two.
+   */
+  const elasticDrawable = useMemo(
+    () => (elasticSolution ? deriveField(elasticSolution, elasticField) : null),
+    [elasticSolution, elasticField],
+  );
+
   /** The transient problem as currently stated, or null when there is none. */
   const transientRequest = useMemo(() => {
     if (!mesh || !boundary || geometryError) return null;
@@ -435,8 +536,17 @@ export default function Page() {
 
   /** What the viewport draws, whichever study is showing. */
   const shownField: DrawableField | null =
-    study === "transient" ? transientFrame : solution;
-  const shownIsStale = study === "transient" ? transientIsStale : solutionIsStale;
+    study === "transient"
+      ? transientFrame
+      : study === "elastic"
+        ? elasticDrawable
+        : solution;
+  const shownIsStale =
+    study === "transient"
+      ? transientIsStale
+      : study === "elastic"
+        ? elasticIsStale
+        : solutionIsStale;
   const shownTime =
     study === "transient" && transientFrames.length > 0
       ? transientFrames[Math.min(playback.frame, transientFrames.length - 1)].time
@@ -444,6 +554,28 @@ export default function Page() {
 
   const canSolve =
     solveRequest !== null && !meshIsStale && solveStatus !== "solving" && !geometryError;
+
+  const canSolveElastic =
+    elasticRequest !== null &&
+    !meshIsStale &&
+    elasticStatus !== "solving" &&
+    !geometryError;
+
+  /**
+   * How far the drawn shape is displaced, in world units per unit of movement.
+   *
+   * The automatic factor opens the deformation to a readable size -- a steel
+   * bracket under a realistic load moves by microns -- and the slider is a
+   * multiple of it. Zero only when nothing is being drawn, so the surface's own
+   * warp uniform stays harmless in every other study.
+   */
+  const warp = useMemo(() => {
+    if (study !== "elastic" || !elasticSolution) return 0;
+    return (
+      autoWarpScale(elasticSolution.largest_displacement, elasticSolution.extent) *
+      deformation
+    );
+  }, [study, elasticSolution, deformation]);
 
   /** World units of height per unit of field, as the 3D view draws it. */
   const zScale = useMemo(
@@ -489,6 +621,46 @@ export default function Page() {
     setStudy("steady");
     runSolve(solveRequest, meshKey);
   }, [solveRequest, meshKey, runSolve]);
+
+  const handleSolveElastic = useCallback(() => {
+    if (!elasticRequest || !meshKey) return;
+    setStudy("elastic");
+    runElastic(elasticRequest, meshKey);
+  }, [elasticRequest, meshKey, runElastic]);
+
+  const setElasticLoopCondition = useCallback(
+    (key: LoopKey, next: ElasticConditionValue) => {
+      setElasticConditions((previous) => ({
+        ...previous,
+        loops: { ...previous.loops, [key]: next },
+      }));
+    },
+    [],
+  );
+
+  const setElasticEdgeCondition = useCallback(
+    (key: EdgeKey, next: ElasticConditionValue) => {
+      setElasticConditions((previous) => ({
+        ...previous,
+        edges: { ...previous.edges, [key]: next },
+      }));
+    },
+    [],
+  );
+
+  const clearElasticEdgeCondition = useCallback(
+    (key: EdgeKey, loop: LoopKey, edge: number) => {
+      setElasticConditions((previous) => {
+        const edges = { ...previous.edges };
+        delete edges[key];
+        return { ...previous, edges };
+      });
+      setSelectedEdge((previous) =>
+        previous?.key === loop && previous.edge === edge ? null : previous,
+      );
+    },
+    [],
+  );
 
   const setLoopCondition = useCallback((key: LoopKey, next: ConditionValue) => {
     setConditions((previous) => ({
@@ -574,6 +746,21 @@ export default function Page() {
         return;
       }
 
+      if (editing === "solid") {
+        setElasticConditions((previous) =>
+          previous.edges[key]
+            ? previous
+            : {
+                ...previous,
+                edges: {
+                  ...previous.edges,
+                  [key]: { ...elasticConditionFor(previous, picked.key, picked.edge) },
+                },
+              },
+        );
+        return;
+      }
+
       setConditions((previous) =>
         previous.edges[key]
           ? previous
@@ -607,6 +794,27 @@ export default function Page() {
       };
     },
     [gasConditions],
+  );
+
+  /**
+   * How each boundary edge is stroked while the solid study is showing.
+   *
+   * Supports stroke solid and loads stroke dashed, so "what is holding this" is
+   * answerable from the drawing rather than from the panel — which is the
+   * question a refused solve sends you back to.
+   */
+  const elasticEdgeTone = useCallback(
+    (loop: LoopKey, edge: number) => {
+      const tone =
+        ELASTIC_CONDITION_TONES[elasticConditionFor(elasticConditions, loop, edge).kind];
+      const styles = getComputedStyle(document.documentElement);
+      return {
+        color: styles.getPropertyValue(tone.token).trim() || "#888",
+        dash: tone.dash,
+        width: tone.width,
+      };
+    },
+    [elasticConditions],
   );
 
   /** The velocity field of the frame on screen, when arrows are asked for. */
@@ -663,6 +871,25 @@ export default function Page() {
     ).length;
   }, [mesh, selectedBucket]);
 
+  /**
+   * The field Export writes out, and what to call its scalar in the file.
+   *
+   * Follows the study on screen rather than always the diffusion solve. The
+   * transient study is deliberately excluded: a run is sixty fields, and writing
+   * out whichever frame the slider happens to be on would produce a file whose
+   * name says nothing about which instant it holds.
+   */
+  const exportField = useMemo(() => {
+    if (study === "elastic") {
+      return elasticSolution && elasticDrawable
+        ? { ...elasticDrawable, degree: elasticSolution.degree }
+        : null;
+    }
+    return study === "steady" ? solution : null;
+  }, [study, solution, elasticSolution, elasticDrawable]);
+
+  const exportName = study === "elastic" ? elasticField : "u";
+
   const startDrawing = useCallback((next: Mode) => {
     setDraft([]);
     setMode(next);
@@ -703,6 +930,7 @@ export default function Page() {
                 // them doubles the per-frame buffer work for it.
                 showMesh={showMesh && !playback.playing}
                 zScale={zScale}
+                warp={warp}
                 stale={shownIsStale}
               />
             ) : (
@@ -713,8 +941,15 @@ export default function Page() {
                 cursor={cursor}
                 mesh={mesh}
                 solution={shownField}
-                edgeTone={study === "transient" ? gasEdgeTone : undefined}
+                edgeTone={
+                  study === "transient"
+                    ? gasEdgeTone
+                    : study === "elastic"
+                      ? elasticEdgeTone
+                      : undefined
+                }
                 vectors={shownVectors}
+                warp={warp}
                 showField={showField}
                 fieldStale={shownIsStale}
                 // Drawing and condition-editing are mutually exclusive: a click
@@ -941,6 +1176,96 @@ export default function Page() {
             </Panel>
           )}
 
+          {study === "elastic" && (
+            <>
+              <Panel
+                id="material"
+                title="Material"
+                summary={`E=${material.youngsModulus.toLocaleString()} · ν=${material.poissonRatio} · p=${material.degree}`}
+                open={openPanels.material}
+                onToggle={togglePanel}
+              >
+                <MaterialPanel material={material} onChange={setMaterial} />
+              </Panel>
+
+              {boundary && (
+                <Panel
+                  id="supports"
+                  title="Supports & loads"
+                  summary={
+                    Object.keys(elasticConditions.edges).length > 0
+                      ? `${Object.keys(elasticConditions.edges).length} edge overrides`
+                      : undefined
+                  }
+                  open={openPanels.supports}
+                  onToggle={togglePanel}
+                >
+                  <SupportPanel
+                    boundary={boundary}
+                    holes={holes}
+                    conditions={elasticConditions}
+                    editing={editing === "solid"}
+                    onToggleEditing={() => {
+                      setEditing((previous) => (previous === "solid" ? null : "solid"));
+                      setSelectedEdge(null);
+                      setMode("idle");
+                      setDraft([]);
+                    }}
+                    selectedEdge={selectedEdge}
+                    onLoopCondition={setElasticLoopCondition}
+                    onEdgeCondition={setElasticEdgeCondition}
+                    onClearEdgeCondition={clearElasticEdgeCondition}
+                  />
+                </Panel>
+              )}
+
+              {boundary && (
+                <Panel
+                  id="stress"
+                  title="Stress"
+                  summary={
+                    elasticSolution && elasticIsStale ? (
+                      <button
+                        type="button"
+                        onClick={handleSolveElastic}
+                        disabled={!canSolveElastic}
+                        className="underline disabled:opacity-40"
+                        style={{ color: "var(--status-warning)" }}
+                      >
+                        out of date — re-solve
+                      </button>
+                    ) : elasticStatus === "solving" ? (
+                      "solving…"
+                    ) : undefined
+                  }
+                  open={openPanels.stress}
+                  onToggle={togglePanel}
+                >
+                  <StressPanel
+                    canSolve={canSolveElastic}
+                    solving={elasticStatus === "solving"}
+                    meshIsStale={meshIsStale}
+                    onSolve={handleSolveElastic}
+                    solution={elasticSolution}
+                    field={elasticDrawable}
+                    solutionIsStale={elasticIsStale}
+                    solveError={elasticError}
+                    elapsedMs={elasticElapsedMs}
+                    selectedField={elasticField}
+                    onFieldChange={setElasticField}
+                    planView={activeView === "2d"}
+                    showField={showField}
+                    onShowFieldChange={setShowField}
+                    deformation={deformation}
+                    onDeformationChange={setDeformation}
+                    exaggeration={exaggeration}
+                    onExaggerationChange={setExaggeration}
+                  />
+                </Panel>
+              )}
+            </>
+          )}
+
           {study === "transient" && (
             <>
               <Panel
@@ -1023,7 +1348,11 @@ export default function Page() {
           <Panel id="export" title="Export" open={openPanels.export} onToggle={togglePanel}>
             <ExportPanel
               mesh={mesh}
-              solution={solution}
+              // Whatever the study on screen produced, so Export writes out what
+              // is being looked at rather than only what the diffusion study
+              // last solved.
+              solution={exportField}
+              solutionName={exportName}
               boundary={boundary}
               holes={holes}
               minAngleDeg={minAngleDeg}

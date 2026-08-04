@@ -4,8 +4,10 @@ import { describe, it } from "node:test";
 import {
   autoZScale,
   buildElementOutlines,
+  buildOutlineDisplacements,
   buildPlanOutline,
   buildSurface,
+  buildSurfaceDisplacements,
   latticeIndex,
 } from "./surface.ts";
 import { WORLD_SIZE } from "./viewport.ts";
@@ -156,6 +158,49 @@ describe("buildElementOutlines", () => {
       const [x, y] = outlines.slice(vertex * 3, vertex * 3 + 3);
       const interior = x > 1e-9 && y > 1e-9 && x + y < 1 - 1e-9;
       assert.ok(!interior, `interior point (${x}, ${y}) on the outline`);
+    }
+  });
+});
+
+describe("displacement buffers", () => {
+  it("are absent for a field that carries none", () => {
+    const solution = twoElements();
+    assert.equal(buildSurfaceDisplacements(solution), null);
+    assert.equal(buildOutlineDisplacements(solution), null);
+  });
+
+  /**
+   * The parallel buffers only work because they walk the sample points in
+   * exactly the order their position counterparts do. Checking that by giving
+   * each sample point a displacement equal to its own position: the two buffers
+   * must then agree entry for entry in x and y, and the warp buffer must carry
+   * z = 0 where the position buffer carries the field value.
+   */
+  it("walk the same sample points in the same order as the positions", () => {
+    const solution = twoElements();
+    const displaced = {
+      ...solution,
+      displacements: solution.positions,
+    };
+
+    const surface = buildSurface(solution);
+    const warp = buildSurfaceDisplacements(displaced);
+    assert.ok(warp, "the buffer should exist once displacements are present");
+    assert.equal(warp.length, surface.length);
+
+    for (let vertex = 0; vertex < surface.length / 3; vertex++) {
+      assert.equal(warp[vertex * 3], surface[vertex * 3], `x at ${vertex}`);
+      assert.equal(warp[vertex * 3 + 1], surface[vertex * 3 + 1], `y at ${vertex}`);
+      assert.equal(warp[vertex * 3 + 2], 0, "a displacement has no height");
+    }
+
+    const outlines = buildElementOutlines(solution);
+    const outlineWarp = buildOutlineDisplacements(displaced);
+    assert.ok(outlineWarp);
+    assert.equal(outlineWarp.length, outlines.length);
+    for (let vertex = 0; vertex < outlines.length / 3; vertex++) {
+      assert.equal(outlineWarp[vertex * 3], outlines[vertex * 3], `x at ${vertex}`);
+      assert.equal(outlineWarp[vertex * 3 + 1], outlines[vertex * 3 + 1], `y at ${vertex}`);
     }
   });
 });

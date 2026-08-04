@@ -48,9 +48,19 @@ function paintField(
   solution: DrawableField,
   t: Transform,
   neutral: string,
+  warp: number,
 ) {
-  const { positions, values, sub_triangles, sample_stride } = solution;
+  const { positions, values, sub_triangles, sample_stride, displacements } = solution;
   const scale = fieldScale(solution.min_value, solution.max_value);
+
+  // Resolved once, outside the loops. A study whose field is not a displacement
+  // has nothing to warp by, and multiplying by a literal zero keeps the deformed
+  // and undeformed paths the same arithmetic rather than the same branch taken a
+  // hundred thousand times.
+  const shift = displacements && warp !== 0 ? warp : 0;
+  const at = shift
+    ? (index: number) => positions[index] + displacements![index] * shift
+    : (index: number) => positions[index];
 
   for (let element = 0; element < solution.element_count; element++) {
     const base = element * sample_stride;
@@ -61,9 +71,9 @@ function paintField(
       const c = (base + sub_triangles[corner + 2]) * 2;
 
       context.beginPath();
-      context.moveTo(positions[a] * t.scale + t.offsetX, t.offsetY - positions[a + 1] * t.scale);
-      context.lineTo(positions[b] * t.scale + t.offsetX, t.offsetY - positions[b + 1] * t.scale);
-      context.lineTo(positions[c] * t.scale + t.offsetX, t.offsetY - positions[c + 1] * t.scale);
+      context.moveTo(at(a) * t.scale + t.offsetX, t.offsetY - at(a + 1) * t.scale);
+      context.lineTo(at(b) * t.scale + t.offsetX, t.offsetY - at(b + 1) * t.scale);
+      context.lineTo(at(c) * t.scale + t.offsetX, t.offsetY - at(c + 1) * t.scale);
       context.closePath();
 
       // The sub-triangle takes one colour, from the mean of its corners. A flat
@@ -153,6 +163,16 @@ interface MeshCanvasProps {
    */
   vectors?: { origins: ArrayLike<number>; values: ArrayLike<number>; fastest: number } | null;
 
+  /**
+   * How far to exaggerate the field's displacement when drawing it.
+   *
+   * A view parameter rather than part of `solution`, for the same reason the
+   * surface view's vertical scale is: it changes how the same answer is drawn,
+   * not what was solved. Ignored -- and costing nothing -- for a field that
+   * carries no displacement, which is every study but the solid.
+   */
+  warp?: number;
+
   /** Clicking an edge selects it, rather than placing a geometry point. */
   edgePickEnabled: boolean;
   selectedEdge: EdgeRef | null;
@@ -184,6 +204,7 @@ export function MeshCanvas({
   solution,
   edgeTone,
   vectors,
+  warp = 0,
   showField,
   fieldStale,
   edgePickEnabled,
@@ -377,6 +398,10 @@ export function MeshCanvas({
         solution.element_count,
         solution.subdivisions,
         solution.identity ?? null,
+        // Without this the exaggeration slider would move and the bitmap would
+        // not: the cached raster is what is on screen, and the warp is baked
+        // into it.
+        solution.displacements ? warp : 0,
         transform,
         neutral,
         ratio,
@@ -392,7 +417,7 @@ export function MeshCanvas({
         const target = buffer.getContext("2d");
         if (target) {
           target.setTransform(ratio, 0, 0, ratio, 0, 0);
-          paintField(target, solution, transform, neutral);
+          paintField(target, solution, transform, neutral, warp);
         }
         cached = { key: cacheKey, canvas: buffer };
         fieldCacheRef.current = cached;
@@ -683,6 +708,7 @@ export function MeshCanvas({
     solution,
     edgeTone,
     vectors,
+    warp,
     showField,
     fieldStale,
     edgePickEnabled,

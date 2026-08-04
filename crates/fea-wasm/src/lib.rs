@@ -21,10 +21,14 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 mod classify;
+pub mod elastic;
 pub mod transient;
 mod sample;
 mod solve;
 
+pub use elastic::{
+    solve_elastic_problem, ElasticConditionSpec, ElasticRequest, ElasticResponse, PlaneStateSpec,
+};
 pub use solve::{solve_problem, ConditionSpec, SolveRequest, SolveResponse, SourceSpec};
 
 /// Hard memory ceiling for the test binary.
@@ -384,6 +388,17 @@ pub fn solve(request: JsValue) -> Result<JsValue, JsValue> {
         .map_err(|error| JsValue::from_str(&format!("invalid solve request: {}", error)))?;
 
     let response = solve_problem(request).map_err(|error| JsValue::from_str(&error))?;
+
+    serde_wasm_bindgen::to_value(&response)
+        .map_err(|error| JsValue::from_str(&format!("could not serialise solution: {}", error)))
+}
+
+#[wasm_bindgen]
+pub fn solve_elastic(request: JsValue) -> Result<JsValue, JsValue> {
+    let request: ElasticRequest = serde_wasm_bindgen::from_value(request)
+        .map_err(|error| JsValue::from_str(&format!("invalid elastic request: {}", error)))?;
+
+    let response = solve_elastic_problem(request).map_err(|error| JsValue::from_str(&error))?;
 
     serde_wasm_bindgen::to_value(&response)
         .map_err(|error| JsValue::from_str(&format!("could not serialise solution: {}", error)))

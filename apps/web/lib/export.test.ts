@@ -292,4 +292,39 @@ describe("solution VTK export", () => {
     const start = lines.indexOf("CELL_TYPES 2");
     assert.deepEqual(lines.slice(start + 1, start + 3), ["5", "5"]);
   });
+
+  it("names the scalar, so a solid's stress is not called u", () => {
+    assert.ok(lines.includes("SCALARS u double 1"));
+    const named = toVtkField(twoElementField(), "von_mises").split("\n");
+    assert.ok(named.includes("SCALARS von_mises double 1"));
+  });
+
+  it("omits the displacement block for a field that has none", () => {
+    assert.ok(
+      !lines.some((line) => line.startsWith("VECTORS")),
+      "writing zeros would let a reader mistake 'no displacement' for 'did not move'",
+    );
+  });
+
+  /**
+   * The displacement is what lets a reader reproduce the deformed shape rather
+   * than only the colours -- ParaView's Warp By Vector takes exactly this.
+   */
+  it("writes the displacement as vectors when the field carries one", () => {
+    const displaced = {
+      ...twoElementField(),
+      displacements: [0, 0, 1, 0, 0, 1, 2, 0, 2, 2, 0, 2],
+    };
+    const out = toVtkField(displaced, "magnitude").split("\n");
+    const start = out.indexOf("VECTORS displacement double");
+    assert.notEqual(start, -1, "the vector block is missing");
+    assert.deepEqual(out.slice(start + 1, start + 7), [
+      "0 0 0",
+      "1 0 0",
+      "0 1 0",
+      "2 0 0",
+      "2 2 0",
+      "0 2 0",
+    ]);
+  });
 });

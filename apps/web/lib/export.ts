@@ -1,5 +1,5 @@
 import type { Loop, MeshResponse } from "./mesh";
-import type { SolveResponse } from "./solve";
+import type { DrawableField } from "./solve";
 
 /**
  * Gmsh ASCII mesh, format 2.2.
@@ -97,7 +97,10 @@ export function toVtk(mesh: MeshResponse): string {
  * of every point, duplicated along shared edges. ParaView renders that as-is,
  * jumps included.
  */
-export function toVtkField(field: SolveResponse): string {
+export function toVtkField(
+  field: DrawableField & { degree: number },
+  name = "u",
+): string {
   const points = field.element_count * field.sample_stride;
   const perElement = field.sub_triangles.length / 3;
   const cells = field.element_count * perElement;
@@ -131,8 +134,20 @@ export function toVtkField(field: SolveResponse): string {
   lines.push("", `CELL_TYPES ${cells}`);
   for (let i = 0; i < cells; i++) lines.push("5");
 
-  lines.push("", `POINT_DATA ${points}`, "SCALARS u double 1", "LOOKUP_TABLE default");
-  for (const value of field.values) lines.push(String(value));
+  lines.push("", `POINT_DATA ${points}`, `SCALARS ${name} double 1`, "LOOKUP_TABLE default");
+  for (let i = 0; i < points; i++) lines.push(String(field.values[i]));
+
+  // The displacement goes out as a VECTORS block, which is what lets ParaView's
+  // Warp By Vector reproduce the deformed shape the app draws. Only the solid
+  // study has one; every other field omits the block entirely rather than
+  // writing zeros, so an importer cannot mistake "no displacement" for "did not
+  // move".
+  if (field.displacements) {
+    lines.push("", "VECTORS displacement double");
+    for (let i = 0; i < points; i++) {
+      lines.push(`${field.displacements[i * 2]} ${field.displacements[i * 2 + 1]} 0`);
+    }
+  }
 
   lines.push("");
   return lines.join("\n");

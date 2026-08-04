@@ -106,6 +106,72 @@ export function buildElementOutlines(solution: DrawableField): Float32Array {
 }
 
 /**
+ * The displacement at each vertex `buildSurface` emits, in the same order.
+ *
+ * A parallel buffer rather than a deformed copy of `buildSurface`'s output, so
+ * the exaggeration is a shader uniform -- the same argument the whole module is
+ * built on for the vertical scale. `z` is zero: a displacement is in the plan,
+ * and the height axis is already spoken for by the field.
+ *
+ * Returns `null` when the field carries no displacement, which is every study
+ * but the solid. The caller then leaves the attribute disabled and the shader
+ * reads a constant zero.
+ */
+export function buildSurfaceDisplacements(solution: DrawableField): Float32Array | null {
+  const { displacements, sub_triangles, sample_stride, element_count } = solution;
+  if (!displacements) return null;
+
+  const out = new Float32Array(element_count * sub_triangles.length * 3);
+
+  let write = 0;
+  for (let element = 0; element < element_count; element++) {
+    const base = element * sample_stride;
+    for (let corner = 0; corner < sub_triangles.length; corner++) {
+      const point = base + sub_triangles[corner];
+      out[write++] = displacements[point * 2];
+      out[write++] = displacements[point * 2 + 1];
+      out[write++] = 0;
+    }
+  }
+
+  return out;
+}
+
+/** The same, walking the order `buildElementOutlines` emits. */
+export function buildOutlineDisplacements(solution: DrawableField): Float32Array | null {
+  const { displacements, sample_stride, element_count, subdivisions } = solution;
+  if (!displacements) return null;
+
+  const n = Math.max(1, subdivisions);
+  const sides: number[][] = [[], [], []];
+  for (let step = 0; step <= n; step++) {
+    sides[0].push(latticeIndex(step, 0, n));
+    sides[1].push(latticeIndex(n - step, step, n));
+    sides[2].push(latticeIndex(0, n - step, n));
+  }
+
+  const segmentsPerElement = 3 * n;
+  const out = new Float32Array(element_count * segmentsPerElement * 2 * 3);
+
+  let write = 0;
+  for (let element = 0; element < element_count; element++) {
+    const base = element * sample_stride;
+    for (const side of sides) {
+      for (let step = 0; step + 1 < side.length; step++) {
+        for (const local of [side[step], side[step + 1]]) {
+          const point = base + local;
+          out[write++] = displacements[point * 2];
+          out[write++] = displacements[point * 2 + 1];
+          out[write++] = 0;
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
  * The mesh wireframe, flat on the ground plane, as a line list.
  *
  * Drawn from the mesh rather than from the solution because this is the *plan*:

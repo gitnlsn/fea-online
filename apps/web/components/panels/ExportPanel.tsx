@@ -11,11 +11,21 @@ import {
   type GeometryDocument,
 } from "../../lib/export";
 import type { Loop, MeshResponse } from "../../lib/mesh";
-import type { SolveResponse } from "../../lib/solve";
+import type { DrawableField } from "../../lib/solve";
 
 interface ExportPanelProps {
   mesh: MeshResponse | null;
-  solution: SolveResponse | null;
+  /**
+   * The field to write out, whichever study produced it.
+   *
+   * A `DrawableField` rather than a `SolveResponse`, so a solid's stress goes
+   * out through the same writer a diffusion field does — and carries its
+   * displacement with it, which is what lets a reader reproduce the deformed
+   * shape rather than only the colours.
+   */
+  solution: (DrawableField & { degree: number }) | null;
+  /** What the scalar is called in the file, e.g. "u" or "von_mises". */
+  solutionName: string;
   boundary: Loop | null;
   holes: Loop[];
   minAngleDeg: number;
@@ -29,6 +39,7 @@ interface ExportPanelProps {
 export function ExportPanel({
   mesh,
   solution,
+  solutionName,
   boundary,
   holes,
   minAngleDeg,
@@ -53,7 +64,9 @@ export function ExportPanel({
         <ExportButton
           label="Solution .vtk"
           disabled={!solution}
-          onClick={() => solution && download("solution.vtk", toVtkField(solution))}
+          onClick={() =>
+            solution && download("solution.vtk", toVtkField(solution, solutionName))
+          }
         />
         <ExportButton
           label="Geometry .json"
